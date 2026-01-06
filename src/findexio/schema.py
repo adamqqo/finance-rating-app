@@ -1,0 +1,105 @@
+SQL_SCHEMA = """
+CREATE SCHEMA IF NOT EXISTS core;
+
+-- =====================
+-- RPO
+-- =====================
+CREATE TABLE IF NOT EXISTS core.rpo_all_orgs (
+    ico         TEXT PRIMARY KEY,
+    name        TEXT,
+    legal_form  TEXT,
+    status      TEXT,
+    address     TEXT,
+    updated_at  TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS core.rpo_bulk_state (
+    id                  SMALLINT PRIMARY KEY DEFAULT 1,
+    last_init_key       TEXT,
+    last_daily_key      TEXT,
+    last_run_at         TIMESTAMPTZ
+);
+
+INSERT INTO core.rpo_bulk_state (id) VALUES (1)
+ON CONFLICT (id) DO NOTHING;
+
+-- =====================
+-- RÚZ: Units
+-- =====================
+CREATE TABLE IF NOT EXISTS core.ruz_units (
+    id                       BIGINT PRIMARY KEY,
+    ico                      TEXT,
+    id_uctovnych_zavierok    JSONB NOT NULL DEFAULT '[]'::jsonb,
+    updated_at               TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_ruz_units_ico ON core.ruz_units(ico);
+
+CREATE TABLE IF NOT EXISTS core.ruz_unit_zavierky (
+    unit_id      BIGINT NOT NULL,
+    zavierka_id  BIGINT NOT NULL,
+    PRIMARY KEY (unit_id, zavierka_id)
+);
+CREATE INDEX IF NOT EXISTS ix_ruz_unit_zavierky_zid ON core.ruz_unit_zavierky(zavierka_id);
+
+CREATE TABLE IF NOT EXISTS core.ruz_units_state (
+    id                SMALLINT PRIMARY KEY DEFAULT 1,
+    zmenene_od        TIMESTAMPTZ,
+    pokracovat_za_id  BIGINT,
+    last_run_at       TIMESTAMPTZ
+);
+INSERT INTO core.ruz_units_state (id) VALUES (1)
+ON CONFLICT (id) DO NOTHING;
+
+-- =====================
+-- RÚZ: Statements (účtovné závierky)
+-- =====================
+CREATE TABLE IF NOT EXISTS core.ruz_statements (
+    id                      BIGINT PRIMARY KEY,
+    id_uctovnej_jednotky    BIGINT,
+    obdobie_od              DATE,
+    obdobie_do              DATE,
+    druh_zavierky           TEXT,
+    typ_zavierky            TEXT,
+    pristupnost_dat         TEXT,
+    datum_poslednej_upravy  DATE,
+    id_uctovnych_vykazov    JSONB NOT NULL DEFAULT '[]'::jsonb,
+    updated_at              TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_ruz_statements_unit ON core.ruz_statements(id_uctovnej_jednotky);
+
+-- =====================
+-- RÚZ: Reports (účtovné výkazy) + row index
+-- =====================
+CREATE TABLE IF NOT EXISTS core.ruz_reports (
+    id                      BIGINT PRIMARY KEY,
+    ico                     TEXT,
+    id_uctovnej_zavierky    BIGINT,
+    id_vyrocnej_spravy      BIGINT,
+    id_sablony              BIGINT,
+    mena                    TEXT,
+    pristupnost             TEXT,
+    pocet_stran             INTEGER,
+    jazyk                   TEXT,
+    zdroj_dat               TEXT,
+    datum_poslednej_upravy  DATE,
+    titulna                 JSONB,
+    tabulky                 JSONB,
+    prilohy                 JSONB,
+    updated_at              TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_ruz_reports_ico  ON core.ruz_reports(ico);
+CREATE INDEX IF NOT EXISTS ix_ruz_reports_year ON core.ruz_reports(((titulna->>'obdobieDo')));
+
+CREATE TABLE IF NOT EXISTS core.ruz_report_rows (
+    row_id        BIGSERIAL PRIMARY KEY,
+    report_id     BIGINT NOT NULL,
+    table_name    TEXT,
+    row_idx       INTEGER,
+    row_key       TEXT,
+    row_name      TEXT,
+    cells         JSONB,
+    updated_at    TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_rrows_report ON core.ruz_report_rows(report_id);
+CREATE INDEX IF NOT EXISTS ix_rrows_table  ON core.ruz_report_rows(report_id, table_name);
+"""
