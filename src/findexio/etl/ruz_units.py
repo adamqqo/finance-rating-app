@@ -20,11 +20,6 @@ SESSION = build_session(user_agent="Findexio/0.1 (ruz-units)")
 REQUEST_TIMEOUT = (DEFAULT_TIMEOUT[0], 45)
 
 log = logging.getLogger("findexio.ruz_units")
-if not log.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", "%H:%M:%S"))
-    log.addHandler(_h)
-log.setLevel(logging.INFO)
 
 SQL_GET_STATE = "SELECT zmenene_od, pokracovat_za_id FROM core.ruz_units_state WHERE id = 1;"
 

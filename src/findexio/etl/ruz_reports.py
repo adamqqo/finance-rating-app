@@ -18,11 +18,6 @@ DETAIL_PATH = "/api/uctovny-vykaz"
 REQUEST_TIMEOUT = DEFAULT_TIMEOUT
 
 log = logging.getLogger("findexio.ruz_reports")
-if not log.handlers:
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", "%H:%M:%S"))
-    log.addHandler(h)
-log.setLevel(logging.INFO)
 
 SQL_COUNT_MISSING = """
 SELECT COUNT(*) AS c
