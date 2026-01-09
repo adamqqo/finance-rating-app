@@ -18,9 +18,10 @@ LEGAL_FORMS_DEFAULT: Tuple[str, ...] = ("112", "121")
 SQL_COUNT_CANDIDATES = """
 SELECT COUNT(*) AS c
 FROM core.ruz_reports r
+JOIN core.rpo_all_orgs o ON o.ico = r.ico
 LEFT JOIN core.ruz_report_items i ON i.report_id = r.id
 WHERE r.id_sablony IS NOT NULL
-  AND (r.titulna->>'pravnaForma') = ANY(%s)
+  AND o.legal_form_code = ANY(%s)
   AND r.tabulky IS NOT NULL
   AND i.report_id IS NULL;
 """
@@ -30,12 +31,14 @@ SQL_FETCH_CANDIDATES = """
 SELECT r.id AS report_id,
        r.id_sablony AS template_id,
        r.ico,
+       o.legal_form_code,
        r.titulna,
        r.tabulky
 FROM core.ruz_reports r
+JOIN core.rpo_all_orgs o ON o.ico = r.ico
 LEFT JOIN core.ruz_report_items i ON i.report_id = r.id
 WHERE r.id_sablony IS NOT NULL
-  AND (r.titulna->>'pravnaForma') = ANY(%s)
+  AND o.legal_form_code = ANY(%s)
   AND r.tabulky IS NOT NULL
   AND i.report_id IS NULL
   AND r.id > %s
@@ -198,7 +201,7 @@ def run_sync(
                         titulna = r.get("titulna") or {}
                         tabulky = r.get("tabulky") or []
 
-                        pravna_forma = _safe_str(titulna.get("pravnaForma"))
+                        pravna_forma = _safe_str(r.get("legal_form_code"))
                         obdobie_do = _safe_str(titulna.get("obdobieDo"))
                         ico = _safe_str(r.get("ico"))
 
