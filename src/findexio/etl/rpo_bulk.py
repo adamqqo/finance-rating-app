@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import time
 import io
-import re
 import gzip
 import json
 import logging
+import re
+import time
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -16,7 +16,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from ..config import RPO_S3_ENDPOINT
-from ..db import get_conn, ensure_schema
+from ..db import ensure_schema, get_conn
 
 S3_ENDPOINT = RPO_S3_ENDPOINT.rstrip("/")
 BUCKET = "susr-rpo"
@@ -29,15 +29,39 @@ SQL_SET_INIT = "UPDATE core.rpo_bulk_state SET last_init_key = %s, last_run_at =
 SQL_SET_DAILY = "UPDATE core.rpo_bulk_state SET last_daily_key = %s, last_run_at = now() WHERE id = 1;"
 SQL_GET_STATE = "SELECT last_init_key, last_daily_key FROM core.rpo_bulk_state WHERE id = 1;"
 
+# Upsert now includes legal_form_code + legal_form_name.
 SQL_UPSERT = """
-INSERT INTO core.rpo_all_orgs (ico, name, legal_form, status, address, updated_at)
-VALUES (%s, %s, %s, %s, %s, now())
+INSERT INTO core.rpo_all_orgs (
+  ico, name, legal_form, legal_form_code, legal_form_name,
+  status, address, updated_at
+)
+VALUES (%s, %s, %s, %s, %s, %s, %s, now())
 ON CONFLICT (ico) DO UPDATE SET
-  name       = EXCLUDED.name,
-  legal_form = EXCLUDED.legal_form,
-  status     = EXCLUDED.status,
-  address    = EXCLUDED.address,
-  updated_at = now();
+  name            = EXCLUDED.name,
+  legal_form      = EXCLUDED.legal_form,
+  legal_form_code = EXCLUDED.legal_form_code,
+  legal_form_name = EXCLUDED.legal_form_name,
+  status          = EXCLUDED.status,
+  address         = EXCLUDED.address,
+  updated_at      = now();
+"""
+
+# Backfill for DBs where INIT was already applied before the columns existed.
+# Reconstruct legal_form_code / legal_form_name from legacy legal_form text
+# e.g. "112 - Obchodná spoločnosť" or "112 – Obchodná spoločnosť".
+SQL_BACKFILL_FROM_LEGAL_FORM = r"""
+UPDATE core.rpo_all_orgs
+SET
+  legal_form_code = COALESCE(
+    legal_form_code,
+    (regexp_match(legal_form, '^\s*(\d+)\s*[\-–—]\s*(.+?)\s*$'))[1]
+  ),
+  legal_form_name = COALESCE(
+    legal_form_name,
+    (regexp_match(legal_form, '^\s*(\d+)\s*[\-–—]\s*(.+?)\s*$'))[2]
+  )
+WHERE legal_form IS NOT NULL
+  AND (legal_form_code IS NULL OR legal_form_name IS NULL);
 """
 
 
@@ -65,25 +89,21 @@ def list_objects(prefix: str) -> List[Dict[str, Any]]:
         token = resp.get("NextContinuationToken")
     return out
 
-def _init_date_from_key(key: str) -> Optional[str]:
+
+def download_object(key: str) -> bytes:
+    cli = s3_client()
+    resp = cli.get_object(Bucket=BUCKET, Key=key)
+    return resp["Body"].read()
+
+
+def _init_date_from_key(key: Optional[str]) -> Optional[str]:
     m = re.search(r"batch-init/init_(\d{4}-\d{2}-\d{2})_\d+\.json\.gz$", key or "")
     return m.group(1) if m else None
 
-def init_keys_for_latest_date(objs: List[Dict[str, Any]]) -> Tuple[str, List[str]]:
-    pat = re.compile(r"^batch-init/init_(\d{4}-\d{2}-\d{2})_(\d+)\.json\.gz$")
-    by_date: Dict[str, List[Tuple[int, str]]] = {}
-    for o in objs:
-        k = o["Key"]
-        m = pat.match(k)
-        if not m:
-            continue
-        date_str, seq = m.group(1), int(m.group(2))
-        by_date.setdefault(date_str, []).append((seq, k))
-    if not by_date:
-        return "", []
-    latest_date = sorted(by_date.keys())[-1]
-    seq_keys = [k for _, k in sorted(by_date[latest_date])]
-    return latest_date, seq_keys
+
+def _export_date_from_daily_key(key: str) -> Optional[datetime]:
+    m = re.search(r"actual_(\d{4}-\d{2}-\d{2})\.json\.gz$", key)
+    return datetime.strptime(m.group(1), "%Y-%m-%d") if m else None
 
 
 def daily_keys_sorted(objs: List[Dict[str, Any]]) -> List[str]:
@@ -98,12 +118,6 @@ def daily_keys_sorted(objs: List[Dict[str, Any]]) -> List[str]:
         parsed.append((d, k))
     parsed.sort()
     return [k for _, k in parsed]
-
-
-def download_object(key: str) -> bytes:
-    cli = s3_client()
-    resp = cli.get_object(Bucket=BUCKET, Key=key)
-    return resp["Body"].read()
 
 
 def _parse_dt(s: Optional[str]) -> Optional[datetime]:
@@ -126,15 +140,11 @@ def _pick_current(entries: Optional[List[Dict[str, Any]]]) -> Optional[Dict[str,
     return entries[-1]
 
 
-def _export_date_from_daily_key(key: str) -> Optional[datetime]:
-    m = re.search(r"actual_(\d{4}-\d{2}-\d{2})\.json\.gz$", key)
-    return datetime.strptime(m.group(1), "%Y-%m-%d") if m else None
-
-
 def iter_export_records(payload: bytes) -> Iterable[Dict[str, Any]]:
     with gzip.GzipFile(fileobj=io.BytesIO(payload)) as gz:
         raw = gz.read()
 
+    # Some exports are a JSON object with "results", others are JSON lines.
     try:
         obj = json.loads(raw)
         if isinstance(obj, dict) and isinstance(obj.get("results"), list):
@@ -162,6 +172,21 @@ def iter_export_records(payload: bytes) -> Iterable[Dict[str, Any]]:
             yield rec
 
 
+_LF_RE = re.compile(r"^\s*(\d+)\s*[\-–—]\s*(.+?)\s*$")
+
+
+def parse_legal_form_text(legal_form: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Parse "XXX - Name" style legal form (accepts -, – and —)."""
+    if not legal_form:
+        return None, None
+    m = _LF_RE.match(str(legal_form))
+    if not m:
+        return None, None
+    code = m.group(1).strip() if m.group(1) else None
+    name = m.group(2).strip() if m.group(2) else None
+    return (code or None), (name or None)
+
+
 def normalize_item(it: Dict[str, Any]) -> Dict[str, Optional[str]]:
     ico: Optional[str] = None
     ids = it.get("identifiers") or []
@@ -184,16 +209,33 @@ def normalize_item(it: Dict[str, Any]) -> Dict[str, Optional[str]]:
             break
 
     legal_form: Optional[str] = None
+    legal_form_code: Optional[str] = None
+    legal_form_name: Optional[str] = None
+
     lf_arr = it.get("legalForms") or []
     lf = _pick_current(lf_arr)
     if isinstance(lf, dict):
-        val = lf.get("value") or {}
+        val = lf.get("value")
+        # Typical shape: {"code": "112", "value": "Obchodná spoločnosť"}
         if isinstance(val, dict):
-            code = val.get("code")
-            txt = val.get("value")
-            legal_form = f"{code} – {txt}" if code and txt else (txt or code)
+            legal_form_code = str(val.get("code")).strip() if val.get("code") is not None else None
+            legal_form_name = str(val.get("value")).strip() if val.get("value") is not None else None
+        elif val is not None:
+            # Fallback to string; we'll try to parse later.
+            legal_form = str(val).strip() or None
+
+    # Keep legacy legal_form text column populated in a consistent format.
+    if not legal_form and (legal_form_code or legal_form_name):
+        if legal_form_code and legal_form_name:
+            legal_form = f"{legal_form_code} - {legal_form_name}"
         else:
-            legal_form = str(val) if val else None
+            legal_form = legal_form_name or legal_form_code
+
+    # If we still don't have code/name, derive from legal_form text.
+    if (not legal_form_code or not legal_form_name) and legal_form:
+        c, n = parse_legal_form_text(legal_form)
+        legal_form_code = legal_form_code or c
+        legal_form_name = legal_form_name or n
 
     status = "terminated" if it.get("termination") else "active"
 
@@ -214,9 +256,20 @@ def normalize_item(it: Dict[str, Any]) -> Dict[str, Optional[str]]:
         "ico": ico if (ico and ico.isdigit() and len(ico) == 8) else None,
         "name": name,
         "legal_form": legal_form,
+        "legal_form_code": legal_form_code,
+        "legal_form_name": legal_form_name,
         "status": status,
         "address": address,
     }
+
+
+def backfill_legal_form_fields(conn: psycopg.Connection) -> int:
+    """Backfill legal_form_code/legal_form_name from legal_form for existing rows."""
+    with conn.cursor() as cur:
+        cur.execute(SQL_BACKFILL_FROM_LEGAL_FORM)
+        updated = cur.rowcount if cur.rowcount is not None else 0
+    conn.commit()
+    return int(updated) if updated and updated > 0 else 0
 
 
 def apply_batch_to_db(
@@ -224,14 +277,10 @@ def apply_batch_to_db(
     payload: bytes,
     conn: psycopg.Connection,
     *,
-    commit_every: int = 10000,
-    log_every: int = 50000,
+    commit_every: int = 10_000,
+    log_every: int = 50_000,
 ) -> int:
-    """
-    Apply one INIT/DAILY gzip export into DB with batching + progress logs.
-    - commit_every: commit after N successful upserts (reduces risk on long runs)
-    - log_every: log progress each N processed records
-    """
+    """Apply one INIT/DAILY gzip export into DB with batching + progress logs."""
     t0 = time.time()
     n = 0
     skipped_no_ico = 0
@@ -247,7 +296,15 @@ def apply_batch_to_db(
 
             cur.execute(
                 SQL_UPSERT,
-                (ico, meta["name"], meta["legal_form"], meta["status"], meta["address"]),
+                (
+                    ico,
+                    meta["name"],
+                    meta["legal_form"],
+                    meta["legal_form_code"],
+                    meta["legal_form_name"],
+                    meta["status"],
+                    meta["address"],
+                ),
             )
 
             n += 1
@@ -268,9 +325,7 @@ def apply_batch_to_db(
                     rate,
                 )
 
-    # final commit for remainder
     conn.commit()
-
     elapsed = time.time() - t0
     rate = n / elapsed if elapsed > 0 else 0.0
     log.info(
@@ -284,7 +339,6 @@ def apply_batch_to_db(
     return n
 
 
-
 def run_full_sync(
     *,
     apply_daily: bool = True,
@@ -292,6 +346,7 @@ def run_full_sync(
     reset_init: bool = False,
     reset_daily: bool = False,
     reset_all: bool = False,
+    backfill_missing_legal_form_fields: bool = True,
 ) -> None:
     with get_conn(row_factory=dict_row) as conn:
         ensure_schema(conn)
@@ -312,14 +367,18 @@ def run_full_sync(
             conn.execute("UPDATE core.rpo_bulk_state SET last_daily_key = NULL, last_run_at = now() WHERE id = 1;")
             conn.commit()
 
+        # Backfill for older DBs: fill new columns from legal_form.
+        if backfill_missing_legal_form_fields:
+            updated = backfill_legal_form_fields(conn)
+            if updated:
+                log.info("Backfilled legal_form_code/legal_form_name for %d existing org rows.", updated)
+
         st = conn.execute(SQL_GET_STATE).fetchone() or {"last_init_key": None, "last_daily_key": None}
         last_init_key = st["last_init_key"]
         last_daily_key = st["last_daily_key"]
 
-        # INIT
+        # INIT objects, grouped by date
         objs_init = list_objects(PREFIX_INIT)
-
-        # Zoskup INIT súbory podľa dátumu
         pat = re.compile(r"^batch-init/init_(\d{4}-\d{2}-\d{2})_(\d+)\.json\.gz$")
         by_date: Dict[str, List[Tuple[int, str]]] = {}
         for o in objs_init:
@@ -333,7 +392,6 @@ def run_full_sync(
         if not by_date:
             raise RuntimeError("Nenašli sa žiadne 'batch-init' súbory.")
 
-        # Ak máme last_init_key, pokračujeme v tom istom dátume; inak berieme najnovší INIT dátum
         pinned_date = _init_date_from_key(last_init_key) if last_init_key else None
         if pinned_date and pinned_date in by_date:
             init_date_str = pinned_date

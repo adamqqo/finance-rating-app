@@ -24,6 +24,7 @@ def main() -> None:
     sub.add_parser("schema", help="Create/ensure DB schema")
     sub.add_parser("bootstrap", help="RPO (INIT+DAILY) + RUZ pipeline")
     sub.add_parser("daily", help="Cron-friendly daily pipeline")
+    sub.add_parser("update02", help="Update V0.21 only")
 
     p_rpo = sub.add_parser("rpo", help="Run only RPO bulk sync")
     p_rpo.add_argument("--no-daily", action="store_true")
@@ -62,6 +63,10 @@ def main() -> None:
 
     if args.cmd == "daily":
         runner.daily()
+        return
+
+    if args.cmd == "update02":
+        runner.update02()
         return
 
     if args.cmd == "rpo":
