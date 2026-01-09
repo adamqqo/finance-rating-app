@@ -19,11 +19,6 @@ SESSION = build_session(user_agent="Findexio/0.1 (ruz-statements)")
 REQUEST_TIMEOUT = (DEFAULT_TIMEOUT[0], 60)
 
 log = logging.getLogger("findexio.ruz_statements")
-if not log.handlers:
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", "%H:%M:%S"))
-    log.addHandler(h)
-log.setLevel(logging.INFO)
 
 SQL_FETCH_BATCH_ONLY_MISSING = """
 SELECT z.zavierka_id

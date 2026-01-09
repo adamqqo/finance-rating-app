@@ -24,11 +24,6 @@ PREFIX_INIT = "batch-init/"
 PREFIX_DAILY = "batch-daily/"
 
 log = logging.getLogger("findexio.rpo_bulk")
-if not log.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", "%H:%M:%S"))
-    log.addHandler(_h)
-log.setLevel(logging.INFO)
 
 SQL_SET_INIT = "UPDATE core.rpo_bulk_state SET last_init_key = %s, last_run_at = now() WHERE id = 1;"
 SQL_SET_DAILY = "UPDATE core.rpo_bulk_state SET last_daily_key = %s, last_run_at = now() WHERE id = 1;"

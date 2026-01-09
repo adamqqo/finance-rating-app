@@ -2,11 +2,22 @@ from __future__ import annotations
 
 import argparse
 
-from .db import get_conn, ensure_schema
-from .etl import runner, rpo_bulk, ruz_units, ruz_statements, ruz_reports
+from .logging_config import setup_logging
+
+
+def _lazy_imports():
+    # Delay heavier imports until after logging is configured. This prevents
+    # module-level log handlers (if any) from attaching to STDERR before we
+    # route logs to STDOUT.
+    from .db import get_conn, ensure_schema
+    from .etl import runner, rpo_bulk, ruz_units, ruz_statements, ruz_reports
+
+    return get_conn, ensure_schema, runner, rpo_bulk, ruz_units, ruz_statements, ruz_reports
 
 
 def main() -> None:
+    setup_logging()
+
     ap = argparse.ArgumentParser(prog="findexio", description="Findexio ETL")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -37,6 +48,8 @@ def main() -> None:
     p_r.add_argument("--hard-limit", type=int, default=None)
 
     args = ap.parse_args()
+
+    get_conn, ensure_schema, runner, rpo_bulk, ruz_units, ruz_statements, ruz_reports = _lazy_imports()
 
     if args.cmd == "schema":
         with get_conn() as conn:

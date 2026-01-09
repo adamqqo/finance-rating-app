@@ -5,13 +5,21 @@ CREATE SCHEMA IF NOT EXISTS core;
 -- RPO
 -- =====================
 CREATE TABLE IF NOT EXISTS core.rpo_all_orgs (
-    ico         TEXT PRIMARY KEY,
-    name        TEXT,
-    legal_form  TEXT,
-    status      TEXT,
-    address     TEXT,
-    updated_at  TIMESTAMPTZ DEFAULT now()
+    ico              TEXT PRIMARY KEY,
+    name             TEXT,
+    legal_form       TEXT,
+    legal_form_code  TEXT,
+    legal_form_name  TEXT,
+    status           TEXT,
+    address          TEXT,
+    updated_at       TIMESTAMPTZ DEFAULT now()
 );
+
+-- Backward-compatible migrations (safe on existing DBs)
+ALTER TABLE IF EXISTS core.rpo_all_orgs
+  ADD COLUMN IF NOT EXISTS legal_form_code TEXT;
+ALTER TABLE IF EXISTS core.rpo_all_orgs
+  ADD COLUMN IF NOT EXISTS legal_form_name TEXT;
 
 CREATE TABLE IF NOT EXISTS core.rpo_bulk_state (
     id                  SMALLINT PRIMARY KEY DEFAULT 1,
@@ -68,7 +76,7 @@ CREATE TABLE IF NOT EXISTS core.ruz_statements (
 CREATE INDEX IF NOT EXISTS ix_ruz_statements_unit ON core.ruz_statements(id_uctovnej_jednotky);
 
 -- =====================
--- RÚZ: Reports (účtovné výkazy) + row index
+-- RÚZ: Reports (účtovné výkazy)
 -- =====================
 CREATE TABLE IF NOT EXISTS core.ruz_reports (
     id                      BIGINT PRIMARY KEY,
@@ -90,6 +98,7 @@ CREATE TABLE IF NOT EXISTS core.ruz_reports (
 CREATE INDEX IF NOT EXISTS ix_ruz_reports_ico  ON core.ruz_reports(ico);
 CREATE INDEX IF NOT EXISTS ix_ruz_reports_year ON core.ruz_reports(((titulna->>'obdobieDo')));
 
+-- (Voliteľné) row-level staging, ak používaš
 CREATE TABLE IF NOT EXISTS core.ruz_report_rows (
     row_id        BIGSERIAL PRIMARY KEY,
     report_id     BIGINT NOT NULL,
@@ -102,4 +111,64 @@ CREATE TABLE IF NOT EXISTS core.ruz_report_rows (
 );
 CREATE INDEX IF NOT EXISTS ix_rrows_report ON core.ruz_report_rows(report_id);
 CREATE INDEX IF NOT EXISTS ix_rrows_table  ON core.ruz_report_rows(report_id, table_name);
+
+-- =====================
+-- RÚZ: Templates (šablóny)
+-- =====================
+CREATE TABLE IF NOT EXISTS core.ruz_templates (
+    id            BIGINT PRIMARY KEY,
+    nazov         TEXT,
+    nariadenie_mf TEXT,
+    platne_od     DATE,
+    platne_do     DATE,
+    raw           JSONB,
+    updated_at    TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS core.ruz_template_rows (
+    template_id     BIGINT NOT NULL,
+    table_idx       INTEGER NOT NULL,
+    table_name      TEXT,
+    row_number      INTEGER NOT NULL,
+    oznacenie       TEXT,
+    row_text        TEXT,
+    PRIMARY KEY (template_id, table_idx, row_number)
+);
+CREATE INDEX IF NOT EXISTS ix_tpl_rows_template ON core.ruz_template_rows(template_id);
+
+-- =====================
+-- Derived: Report items (template row -> numeric value only; NO raw)
+-- =====================
+CREATE TABLE IF NOT EXISTS core.ruz_report_items (
+    report_id       BIGINT NOT NULL,
+    template_id     BIGINT,
+    ico             TEXT,
+    pravna_forma    TEXT,
+    obdobie_do      TEXT,
+    table_idx       INTEGER NOT NULL,
+    table_name      TEXT,
+    row_number      INTEGER NOT NULL,
+    oznacenie       TEXT,
+    row_text        TEXT,
+    period_col      SMALLINT NOT NULL, -- 1=current, 2=previous (per template)
+    value_num       NUMERIC,
+    updated_at      TIMESTAMPTZ DEFAULT now(),
+    PRIMARY KEY (report_id, table_idx, row_number, period_col)
+);
+CREATE INDEX IF NOT EXISTS ix_ritems_ico ON core.ruz_report_items(ico);
+CREATE INDEX IF NOT EXISTS ix_ritems_pravna_forma ON core.ruz_report_items(pravna_forma);
+CREATE INDEX IF NOT EXISTS ix_ritems_obdobie_do ON core.ruz_report_items(obdobie_do);
+
+-- =====================
+-- State: ruz_report_items (checkpoint for keyset pagination)
+-- =====================
+CREATE TABLE IF NOT EXISTS core.ruz_report_items_state (
+    id              SMALLINT PRIMARY KEY DEFAULT 1,
+    last_report_id  BIGINT NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMPTZ DEFAULT now()
+);
+
+INSERT INTO core.ruz_report_items_state (id, last_report_id)
+VALUES (1, 0)
+ON CONFLICT (id) DO NOTHING;
 """
