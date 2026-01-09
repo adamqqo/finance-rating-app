@@ -87,3 +87,14 @@ def daily() -> None:
     ruz_report_items.run_sync(legal_forms=("112", "121"))
 
     log.info("DAILY finished.")
+
+def update02() -> None:
+   #V0.2 additions only
+    ensure_db()
+    log.info("Running ruz_templates...")
+    ruz_templates.run_sync()
+
+    log.info("Running ruz_report_items (legal_forms=112,121)...")
+    ruz_report_items.run_sync(legal_forms=("112", "121"))
+
+    log.info("V0.2 update finished.")
