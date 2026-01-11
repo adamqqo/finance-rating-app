@@ -3,14 +3,14 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from ..config import RUZ_API_BASE
-from ..db import get_conn, ensure_schema
-from ..http import build_session, DEFAULT_TIMEOUT
+from ..db import ensure_schema, get_conn
+from ..http import DEFAULT_TIMEOUT, build_session
 
 API_BASE = RUZ_API_BASE.rstrip("/")
 DETAIL_PATH = "/api/uctovna-zavierka"
@@ -20,11 +20,16 @@ REQUEST_TIMEOUT = (DEFAULT_TIMEOUT[0], 60)
 
 log = logging.getLogger("findexio.ruz_statements")
 
+LEGAL_FORMS_DEFAULT: Tuple[str, ...] = ("112", "121")
+
 SQL_FETCH_BATCH_ONLY_MISSING = """
 SELECT z.zavierka_id
 FROM core.ruz_unit_zavierky z
+JOIN core.ruz_units u ON u.id = z.unit_id
+JOIN core.rpo_all_orgs o ON o.ico = u.ico
 LEFT JOIN core.ruz_statements s ON s.id = z.zavierka_id
 WHERE s.id IS NULL
+  AND o.legal_form_code = ANY(%s)
 ORDER BY z.zavierka_id
 LIMIT %s OFFSET %s;
 """
@@ -32,6 +37,9 @@ LIMIT %s OFFSET %s;
 SQL_FETCH_BATCH_ALL = """
 SELECT z.zavierka_id
 FROM core.ruz_unit_zavierky z
+JOIN core.ruz_units u ON u.id = z.unit_id
+JOIN core.rpo_all_orgs o ON o.ico = u.ico
+WHERE o.legal_form_code = ANY(%s)
 ORDER BY z.zavierka_id
 LIMIT %s OFFSET %s;
 """
@@ -39,11 +47,20 @@ LIMIT %s OFFSET %s;
 SQL_COUNT_ONLY_MISSING = """
 SELECT COUNT(*) AS c
 FROM core.ruz_unit_zavierky z
+JOIN core.ruz_units u ON u.id = z.unit_id
+JOIN core.rpo_all_orgs o ON o.ico = u.ico
 LEFT JOIN core.ruz_statements s ON s.id = z.zavierka_id
-WHERE s.id IS NULL;
+WHERE s.id IS NULL
+  AND o.legal_form_code = ANY(%s);
 """
 
-SQL_COUNT_ALL = "SELECT COUNT(*) AS c FROM core.ruz_unit_zavierky;"
+SQL_COUNT_ALL = """
+SELECT COUNT(*) AS c
+FROM core.ruz_unit_zavierky z
+JOIN core.ruz_units u ON u.id = z.unit_id
+JOIN core.rpo_all_orgs o ON o.ico = u.ico
+WHERE o.legal_form_code = ANY(%s);
+"""
 
 SQL_UPSERT = """
 INSERT INTO core.ruz_statements (
@@ -115,7 +132,13 @@ def prepare_upsert_params(detail: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def run_sync(*, batch_size: int = 1000, refresh_all: bool = False, hard_limit: Optional[int] = None) -> None:
+def run_sync(
+    *,
+    batch_size: int = 1000,
+    refresh_all: bool = False,
+    hard_limit: Optional[int] = None,
+    legal_forms: Tuple[str, ...] = LEGAL_FORMS_DEFAULT,
+) -> None:
     t0 = time.time()
     total, skipped_tombstone = 0, 0
     offset = 0
@@ -124,14 +147,20 @@ def run_sync(*, batch_size: int = 1000, refresh_all: bool = False, hard_limit: O
         ensure_schema(conn)
 
         total_candidates = int(
-            (conn.execute(SQL_COUNT_ALL if refresh_all else SQL_COUNT_ONLY_MISSING).fetchone() or {"c": 0})["c"]
+            (
+                conn.execute(
+                    SQL_COUNT_ALL if refresh_all else SQL_COUNT_ONLY_MISSING,
+                    (list(legal_forms),),
+                ).fetchone()
+                or {"c": 0}
+            )["c"]
         )
         log.info("Candidates=%d (refresh_all=%s)", total_candidates, refresh_all)
 
         while True:
             rows = conn.execute(
                 SQL_FETCH_BATCH_ALL if refresh_all else SQL_FETCH_BATCH_ONLY_MISSING,
-                (batch_size, offset),
+                (list(legal_forms), batch_size, offset),
             ).fetchall()
 
             if not rows:
@@ -159,10 +188,15 @@ def run_sync(*, batch_size: int = 1000, refresh_all: bool = False, hard_limit: O
 
             elapsed = time.time() - t0
             rate = total / elapsed if elapsed > 0 else 0.0
-            log.info("Processed=%d/%d | offset=%d | batch=%d | speed=%.2f/s | tombstones=%d",
-                     total,
-                     total_candidates if hard_limit is None else min(total_candidates, hard_limit),
-                     offset, len(ids), rate, skipped_tombstone)
+            log.info(
+                "Processed=%d/%d | offset=%d | batch=%d | speed=%.2f/s | tombstones=%d",
+                total,
+                total_candidates if hard_limit is None else min(total_candidates, hard_limit),
+                offset,
+                len(ids),
+                rate,
+                skipped_tombstone,
+            )
 
             if hard_limit is not None and total >= hard_limit:
                 break
