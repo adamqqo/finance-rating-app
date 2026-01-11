@@ -9,8 +9,8 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from ..config import RUZ_API_BASE
-from ..db import get_conn, ensure_schema
-from ..http import build_session, DEFAULT_TIMEOUT
+from ..db import ensure_schema, get_conn
+from ..http import DEFAULT_TIMEOUT, build_session
 
 API_BASE = RUZ_API_BASE.rstrip("/")
 LIST_UNITS = "/api/uctovne-jednotky"
@@ -20,6 +20,8 @@ SESSION = build_session(user_agent="Findexio/0.1 (ruz-units)")
 REQUEST_TIMEOUT = (DEFAULT_TIMEOUT[0], 45)
 
 log = logging.getLogger("findexio.ruz_units")
+
+LEGAL_FORMS_DEFAULT: Tuple[str, ...] = ("112", "121")
 
 SQL_GET_STATE = "SELECT zmenene_od, pokracovat_za_id FROM core.ruz_units_state WHERE id = 1;"
 
@@ -45,6 +47,15 @@ INSERT INTO core.ruz_unit_zavierky (unit_id, zavierka_id)
 SELECT %s AS unit_id, x::bigint AS zavierka_id
 FROM jsonb_array_elements_text(%s::jsonb) AS t(x)
 ON CONFLICT DO NOTHING;
+"""
+
+# Restrict-by-legal-form filter (optional)
+SQL_ICO_ALLOWED = """
+SELECT 1
+FROM core.rpo_all_orgs
+WHERE ico = %s
+  AND legal_form_code = ANY(%s)
+LIMIT 1;
 """
 
 
@@ -114,9 +125,26 @@ def extract_min_fields(detail: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def run_sync(*, since: Optional[str] = None, limit_ids: Optional[int] = None, page_size: int = 1000) -> None:
+def run_sync(
+    *,
+    since: Optional[str] = None,
+    limit_ids: Optional[int] = None,
+    page_size: int = 1000,
+    restrict_to_legal_forms: bool = False,
+    legal_forms: Tuple[str, ...] = LEGAL_FORMS_DEFAULT,
+) -> None:
+    """
+    Sync RUZ units.
+
+    Notes on restrict_to_legal_forms:
+    - LIST endpoint doesn't provide ICO, so we still must call DETAIL for every unit id.
+    - Restriction saves DB writes/storage (ruz_units + ruz_unit_zavierky), but not API calls.
+    - Resume is safe: progress_id advances regardless of upsert/skip.
+    """
     t0 = time.time()
+    total_seen = 0
     total_upserted = 0
+    total_skipped = 0
 
     with get_conn(row_factory=dict_row) as conn:
         ensure_schema(conn)
@@ -136,7 +164,13 @@ def run_sync(*, since: Optional[str] = None, limit_ids: Optional[int] = None, pa
         window_start_str = _dt_to_api(window_start_dt)
         run_started_at = datetime.now(timezone.utc)
 
-        log.info("Listing units from %s (pokracovat-za-id=%s)", window_start_str, progress_id)
+        log.info(
+            "Listing units from %s (pokracovat-za-id=%s) | restrict=%s | legal_forms=%s",
+            window_start_str,
+            progress_id,
+            restrict_to_legal_forms,
+            ",".join(legal_forms),
+        )
 
         while True:
             ids, more = list_unit_ids(window_start_str, progress_id, max_zaznamov=page_size)
@@ -146,7 +180,7 @@ def run_sync(*, since: Optional[str] = None, limit_ids: Optional[int] = None, pa
                 break
 
             if limit_ids is not None:
-                remain = max(0, limit_ids - total_upserted)
+                remain = max(0, limit_ids - total_seen)
                 if remain <= 0:
                     break
                 if len(ids) > remain:
@@ -156,13 +190,31 @@ def run_sync(*, since: Optional[str] = None, limit_ids: Optional[int] = None, pa
             with conn.transaction():
                 with conn.cursor() as cur:
                     for uid in ids:
+                        total_seen += 1
                         try:
                             d = fetch_unit_detail(uid)
                             row = extract_min_fields(d)
 
+                            # Always advance cursor, even on skip, to avoid refetch loops.
+                            progress_id = uid
+
+                            if restrict_to_legal_forms:
+                                if not row["ico"]:
+                                    total_skipped += 1
+                                    continue
+
+                                ok = cur.execute(SQL_ICO_ALLOWED, (row["ico"], list(legal_forms))).fetchone()
+                                if not ok:
+                                    total_skipped += 1
+                                    continue
+
                             cur.execute(
                                 SQL_UPSERT_UNIT,
-                                {"id": row["id"], "ico": row["ico"], "id_uctovnych_zavierok": Json(row["id_uctovnych_zavierok"])},
+                                {
+                                    "id": row["id"],
+                                    "ico": row["ico"],
+                                    "id_uctovnych_zavierok": Json(row["id_uctovnych_zavierok"]),
+                                },
                             )
 
                             cur.execute(SQL_DELETE_LINKS_FOR_UNIT, (row["id"],))
@@ -170,20 +222,35 @@ def run_sync(*, since: Optional[str] = None, limit_ids: Optional[int] = None, pa
                                 cur.execute(SQL_INSERT_LINKS_BULK, (row["id"], Json(row["id_uctovnych_zavierok"])))
 
                             total_upserted += 1
-                            progress_id = uid
+
                         except Exception as e:
-                            log.warning("Unit detail failed (id=%s): %s", uid, e)
+                            # still move progress_id to avoid being stuck on a problematic id
                             progress_id = uid
+                            log.warning("Unit detail failed (id=%s): %s", uid, e)
 
                 conn.execute(SQL_SET_STATE, (window_start_dt, progress_id))
 
             elapsed = time.time() - t0
-            rate = total_upserted / elapsed if elapsed > 0 else 0.0
-            log.info("Upserted=%d | page=%d | speed=%.2f/s | last_id=%s", total_upserted, len(ids), rate, progress_id)
+            rate = total_seen / elapsed if elapsed > 0 else 0.0
+            log.info(
+                "Seen=%d | upserted=%d | skipped=%d | page=%d | speed=%.2f/s | last_id=%s",
+                total_seen,
+                total_upserted,
+                total_skipped,
+                len(ids),
+                rate,
+                progress_id,
+            )
 
             if not more:
                 conn.execute(SQL_SET_STATE, (run_started_at, None))
                 conn.commit()
                 break
 
-        log.info("Done. Units upserted=%d | time=%.1fs", total_upserted, time.time() - t0)
+        log.info(
+            "Done. Units seen=%d | upserted=%d | skipped=%d | time=%.1fs",
+            total_seen,
+            total_upserted,
+            total_skipped,
+            time.time() - t0,
+        )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from decimal import Decimal, InvalidOperation
@@ -46,8 +47,9 @@ ORDER BY r.id
 LIMIT %s;
 """
 
+# IMPORTANT: alias so that dict_row access is stable (no tpl_row[0])
 SQL_FETCH_TEMPLATE_RAW = """
-SELECT raw
+SELECT raw AS tpl_raw
 FROM core.ruz_templates
 WHERE id = %s;
 """
@@ -143,6 +145,44 @@ def _index_for(row_number: int, data_cols: int, period_col: int) -> int:
     return (row_number - 1) * data_cols + (period_col - 1)
 
 
+def _load_template_payload(tpl_raw: Any, *, template_id: int, report_id: int) -> Optional[Dict[str, Any]]:
+    """
+    ruz_templates.raw môže byť:
+      - JSONB -> už je dict
+      - TEXT  -> JSON string
+    Vráti dict alebo None (ak je nevalidné).
+    """
+    if tpl_raw is None:
+        return None
+
+    if isinstance(tpl_raw, dict):
+        return tpl_raw
+
+    if isinstance(tpl_raw, str):
+        s = tpl_raw.strip()
+        if not s:
+            return None
+        try:
+            obj = json.loads(s)
+        except Exception:
+            log.warning("Template raw is not valid JSON (template_id=%s, report_id=%s)", template_id, report_id)
+            return None
+        return obj if isinstance(obj, dict) else None
+
+    # neočakávaný typ (napr. bytes)
+    try:
+        obj = json.loads(tpl_raw)  # type: ignore[arg-type]
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        log.warning(
+            "Template raw has unsupported type=%s (template_id=%s, report_id=%s)",
+            type(tpl_raw).__name__,
+            template_id,
+            report_id,
+        )
+        return None
+
+
 def run_sync(
     *,
     batch_size: int = 200,
@@ -180,7 +220,6 @@ def run_sync(
                 break
 
             # advance keyset cursor immediately based on fetched rows
-            # (so even if some rows fail, we don't get stuck refetching the same batch)
             last_id = int(batch[-1]["report_id"])
 
             with conn.transaction():
@@ -190,14 +229,16 @@ def run_sync(
                         tid = int(r["template_id"])
 
                         tpl_row = cur.execute(SQL_FETCH_TEMPLATE_RAW, (tid,)).fetchone()
-                        if not tpl_row or not tpl_row[0]:
-                            log.warning("Missing template raw for template_id=%s (report_id=%s)", tid, rid)
+                        tpl_raw = tpl_row.get("tpl_raw") if tpl_row else None
+
+                        tpl = _load_template_payload(tpl_raw, template_id=tid, report_id=rid)
+                        if not tpl:
+                            log.warning("Missing/invalid template raw for template_id=%s (report_id=%s)", tid, rid)
                             total_reports += 1
                             if hard_limit is not None and total_reports >= hard_limit:
                                 break
                             continue
 
-                        tpl = tpl_row[0]
                         titulna = r.get("titulna") or {}
                         tabulky = r.get("tabulky") or []
 
@@ -245,6 +286,8 @@ def run_sync(
                                 rows_meta[rn] = (ozn, row_text)
 
                             max_rows = (len(data) // data_cols) if data_cols > 0 else 0
+                            if max_rows <= 0:
+                                continue
 
                             for row_number in range(1, max_rows + 1):
                                 oznacenie, row_text = rows_meta.get(row_number, (None, None))

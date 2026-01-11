@@ -74,17 +74,17 @@ def daily() -> None:
     ensure_db()
     log.info("Starting DAILY pipeline...")
 
-    rpo_bulk.run_full_sync(apply_daily=True)
-    ruz_units.run_sync()
-    ruz_statements.run_sync(refresh_all=False)
-    ruz_reports.run_sync(refresh_all=False)
+    rpo_bulk.run_full_sync(apply_daily=True)   ##REGISTER PRAVNICKYCH OSOB
+    ruz_units.run_sync()                       ##UCTOVNE JEDNOTKY
+    ruz_statements.run_sync(refresh_all=False) ##UCTOVNE ZAVIERKY PRE JEDNOTLIVE UCTOVNE JEDNOTKY
+    ruz_reports.run_sync(refresh_all=False)    ##OBSAH UCTOVNYCH ZAVIEROK
 
     # NEW: templates + exploded report items (BI/ML-ready)
     log.info("Running ruz_templates...")
-    ruz_templates.run_sync()
+    ruz_templates.run_sync()                  ##SABLONY PRE OBSAH UCTOVNYCH ZAVIEROK
 
     log.info("Running ruz_report_items (legal_forms=112,121)...")
-    ruz_report_items.run_sync(legal_forms=("112", "121"))
+    ruz_report_items.run_sync(legal_forms=("112", "121")) ##NAPAROVANIE SABLON S OBSAHOM UCTOVNYCH ZAVIEROK
 
     log.info("DAILY finished.")
 
