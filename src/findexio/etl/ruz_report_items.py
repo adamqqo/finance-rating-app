@@ -8,14 +8,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from psycopg.rows import dict_row
 
-from ..db import get_conn, ensure_schema
+from ..db import ensure_schema, get_conn
 
 log = logging.getLogger("findexio.ruz_report_items")
 
 LEGAL_FORMS_DEFAULT: Tuple[str, ...] = ("112", "121")
 
-# Kandidáti: reporty so šablónou, s tabuľkami, pre zvolené právne formy,
-# ktoré ešte nemajú žiadne itemy (inkrementálne).
+SQL_GET_STATE = "SELECT last_report_id FROM core.ruz_report_items_state WHERE id = 1;"
+SQL_SET_STATE = "UPDATE core.ruz_report_items_state SET last_report_id = %s, updated_at = now() WHERE id = 1;"
+
+# Base candidates (no template filter)
 SQL_COUNT_CANDIDATES = """
 SELECT COUNT(*) AS c
 FROM core.ruz_reports r
@@ -27,7 +29,6 @@ WHERE r.id_sablony IS NOT NULL
   AND i.report_id IS NULL;
 """
 
-# KEYSET pagination: r.id > last_id, no OFFSET
 SQL_FETCH_CANDIDATES = """
 SELECT r.id AS report_id,
        r.id_sablony AS template_id,
@@ -47,6 +48,39 @@ ORDER BY r.id
 LIMIT %s;
 """
 
+# Candidates with template filter
+SQL_COUNT_CANDIDATES_TPL = """
+SELECT COUNT(*) AS c
+FROM core.ruz_reports r
+JOIN core.rpo_all_orgs o ON o.ico = r.ico
+LEFT JOIN core.ruz_report_items i ON i.report_id = r.id
+WHERE r.id_sablony IS NOT NULL
+  AND o.legal_form_code = ANY(%s)
+  AND r.tabulky IS NOT NULL
+  AND i.report_id IS NULL
+  AND r.id_sablony = ANY(%s);
+"""
+
+SQL_FETCH_CANDIDATES_TPL = """
+SELECT r.id AS report_id,
+       r.id_sablony AS template_id,
+       r.ico,
+       o.legal_form_code,
+       r.titulna,
+       r.tabulky
+FROM core.ruz_reports r
+JOIN core.rpo_all_orgs o ON o.ico = r.ico
+LEFT JOIN core.ruz_report_items i ON i.report_id = r.id
+WHERE r.id_sablony IS NOT NULL
+  AND o.legal_form_code = ANY(%s)
+  AND r.tabulky IS NOT NULL
+  AND i.report_id IS NULL
+  AND r.id_sablony = ANY(%s)
+  AND r.id > %s
+ORDER BY r.id
+LIMIT %s;
+"""
+
 # IMPORTANT: alias so that dict_row access is stable (no tpl_row[0])
 SQL_FETCH_TEMPLATE_RAW = """
 SELECT raw AS tpl_raw
@@ -54,7 +88,6 @@ FROM core.ruz_templates
 WHERE id = %s;
 """
 
-# NOTE: no value_raw
 SQL_UPSERT_ITEM = """
 INSERT INTO core.ruz_report_items (
   report_id, template_id, ico, pravna_forma, obdobie_do,
@@ -86,20 +119,12 @@ def _safe_str(x: Any) -> Optional[str]:
 
 
 def _parse_decimal(x: Any) -> Optional[Decimal]:
-    """
-    Parse value into Decimal.
-    If parsing fails (non-numeric / empty), returns None.
-    We intentionally do NOT persist raw values for report_items.
-    """
     if x is None:
         return None
     s = str(x).strip()
     if s == "":
         return None
 
-    # Normalize common formats conservatively:
-    # - remove spaces used as thousands separators
-    # - if comma appears and no dot, treat comma as thousands separator (remove)
     s2 = s.replace(" ", "")
     if s2.count(",") > 0 and s2.count(".") == 0:
         s2 = s2.replace(",", "")
@@ -141,17 +166,10 @@ def _extract_table_meta(
 
 
 def _index_for(row_number: int, data_cols: int, period_col: int) -> int:
-    # row_number is 1-based, period_col is 1..data_cols
     return (row_number - 1) * data_cols + (period_col - 1)
 
 
 def _load_template_payload(tpl_raw: Any, *, template_id: int, report_id: int) -> Optional[Dict[str, Any]]:
-    """
-    ruz_templates.raw môže byť:
-      - JSONB -> už je dict
-      - TEXT  -> JSON string
-    Vráti dict alebo None (ak je nevalidné).
-    """
     if tpl_raw is None:
         return None
 
@@ -169,7 +187,6 @@ def _load_template_payload(tpl_raw: Any, *, template_id: int, report_id: int) ->
             return None
         return obj if isinstance(obj, dict) else None
 
-    # neočakávaný typ (napr. bytes)
     try:
         obj = json.loads(tpl_raw)  # type: ignore[arg-type]
         return obj if isinstance(obj, dict) else None
@@ -185,41 +202,61 @@ def _load_template_payload(tpl_raw: Any, *, template_id: int, report_id: int) ->
 
 def run_sync(
     *,
-    batch_size: int = 200,
-    hard_limit: Optional[int] = None,
+    batch_size: int = 1000,
+    hard_limit: Optional[int] = 20000,
     legal_forms: Tuple[str, ...] = LEGAL_FORMS_DEFAULT,
+    template_ids: Optional[Tuple[int, ...]] = 699,
+    use_state_cursor: bool = True,
 ) -> None:
-    """
-    Explode ruz_reports.tabulky[...].data into normalized core.ruz_report_items
-    using core.ruz_templates.raw.
-
-    - Incremental: only reports without any report_items are processed.
-    - Scoped: by default only legal forms 112 and 121.
-    - Keyset pagination: uses last_id instead of OFFSET (much faster at scale).
-    - No raw persistence: only numeric value_num is stored.
-    """
     t0 = time.time()
     total_reports = 0
     total_items = 0
-    last_id = 0  # keyset cursor
 
     with get_conn(row_factory=dict_row) as conn:
         ensure_schema(conn)
 
-        total_candidates = int(
-            (conn.execute(SQL_COUNT_CANDIDATES, (list(legal_forms),)).fetchone() or {"c": 0})["c"]
+        # start cursor from state (optional)
+        last_id = 0
+        if use_state_cursor:
+            st = conn.execute(SQL_GET_STATE).fetchone() or {"last_report_id": 0}
+            try:
+                last_id = int(st.get("last_report_id") or 0)
+            except Exception:
+                last_id = 0
+
+        # counts
+        if template_ids:
+            total_candidates = int(
+                (conn.execute(SQL_COUNT_CANDIDATES_TPL, (list(legal_forms), list(template_ids))).fetchone() or {"c": 0})[
+                    "c"
+                ]
+            )
+        else:
+            total_candidates = int((conn.execute(SQL_COUNT_CANDIDATES, (list(legal_forms),)).fetchone() or {"c": 0})["c"])
+
+        log.info(
+            "Candidate reports=%d | legal_forms=%s | template_ids=%s | start_last_id=%d",
+            total_candidates,
+            ",".join(legal_forms),
+            ",".join(map(str, template_ids)) if template_ids else "ALL",
+            last_id,
         )
-        log.info("Candidate reports=%d | legal_forms=%s", total_candidates, ",".join(legal_forms))
 
         while True:
             if hard_limit is not None and total_reports >= hard_limit:
                 break
 
-            batch = conn.execute(SQL_FETCH_CANDIDATES, (list(legal_forms), last_id, batch_size)).fetchall()
+            if template_ids:
+                batch = conn.execute(
+                    SQL_FETCH_CANDIDATES_TPL, (list(legal_forms), list(template_ids), last_id, batch_size)
+                ).fetchall()
+            else:
+                batch = conn.execute(SQL_FETCH_CANDIDATES, (list(legal_forms), last_id, batch_size)).fetchall()
+
             if not batch:
                 break
 
-            # advance keyset cursor immediately based on fetched rows
+            # advance keyset cursor immediately based on fetched rows (resume-safe)
             last_id = int(batch[-1]["report_id"])
 
             with conn.transaction():
@@ -233,7 +270,6 @@ def run_sync(
 
                         tpl = _load_template_payload(tpl_raw, template_id=tid, report_id=rid)
                         if not tpl:
-                            log.warning("Missing/invalid template raw for template_id=%s (report_id=%s)", tid, rid)
                             total_reports += 1
                             if hard_limit is not None and total_reports >= hard_limit:
                                 break
@@ -262,10 +298,8 @@ def run_sync(
 
                             tname, data_cols, tpl_rows = _extract_table_meta(tpl, table_idx)
                             if data_cols <= 0:
-                                # conservative fallback (common for POD templates)
                                 data_cols = 2
 
-                            # cisloRiadku -> (oznacenie, row_text)
                             rows_meta: Dict[int, Tuple[Optional[str], Optional[str]]] = {}
                             for rr in tpl_rows:
                                 if not isinstance(rr, dict):
@@ -321,6 +355,10 @@ def run_sync(
                         total_reports += 1
                         if hard_limit is not None and total_reports >= hard_limit:
                             break
+
+                # persist checkpoint after each committed batch
+                if use_state_cursor:
+                    conn.execute(SQL_SET_STATE, (last_id,))
 
             elapsed = time.time() - t0
             rate_r = total_reports / elapsed if elapsed > 0 else 0.0
