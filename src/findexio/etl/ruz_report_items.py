@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from psycopg.rows import dict_row
 
@@ -17,7 +17,6 @@ LEGAL_FORMS_DEFAULT: Tuple[str, ...] = ("112", "121")
 SQL_GET_STATE = "SELECT last_report_id FROM core.ruz_report_items_state WHERE id = 1;"
 SQL_SET_STATE = "UPDATE core.ruz_report_items_state SET last_report_id = %s, updated_at = now() WHERE id = 1;"
 
-# Base candidates (no template filter)
 SQL_COUNT_CANDIDATES = """
 SELECT COUNT(*) AS c
 FROM core.ruz_reports r
@@ -48,7 +47,6 @@ ORDER BY r.id
 LIMIT %s;
 """
 
-# Candidates with template filter
 SQL_COUNT_CANDIDATES_TPL = """
 SELECT COUNT(*) AS c
 FROM core.ruz_reports r
@@ -81,7 +79,6 @@ ORDER BY r.id
 LIMIT %s;
 """
 
-# IMPORTANT: alias so that dict_row access is stable (no tpl_row[0])
 SQL_FETCH_TEMPLATE_RAW = """
 SELECT raw AS tpl_raw
 FROM core.ruz_templates
@@ -200,22 +197,54 @@ def _load_template_payload(tpl_raw: Any, *, template_id: int, report_id: int) ->
         return None
 
 
+TemplateIdsType = Optional[Union[int, Tuple[int, ...], List[int]]]
+
+
+def _normalize_template_ids(template_ids: TemplateIdsType) -> Optional[List[int]]:
+    if template_ids is None:
+        return None
+    if isinstance(template_ids, int):
+        return [int(template_ids)]
+    if isinstance(template_ids, tuple) or isinstance(template_ids, list):
+        out: List[int] = []
+        for x in template_ids:
+            try:
+                out.append(int(x))
+            except Exception:
+                continue
+        return out if out else None
+    # fallback: accept string like "699,687"
+    if isinstance(template_ids, str):
+        parts = [p.strip() for p in template_ids.split(",")]
+        out2: List[int] = []
+        for p in parts:
+            if not p:
+                continue
+            try:
+                out2.append(int(p))
+            except Exception:
+                continue
+        return out2 if out2 else None
+    return None
+
+
 def run_sync(
     *,
     batch_size: int = 1000,
-    hard_limit: Optional[int] = 20000,
+    hard_limit: Optional[int] = None,
     legal_forms: Tuple[str, ...] = LEGAL_FORMS_DEFAULT,
-    template_ids: Optional[Tuple[int, ...]] = 699,
+    template_ids: TemplateIdsType = None,
     use_state_cursor: bool = True,
 ) -> None:
     t0 = time.time()
     total_reports = 0
     total_items = 0
 
+    tpl_ids = _normalize_template_ids(template_ids)
+
     with get_conn(row_factory=dict_row) as conn:
         ensure_schema(conn)
 
-        # start cursor from state (optional)
         last_id = 0
         if use_state_cursor:
             st = conn.execute(SQL_GET_STATE).fetchone() or {"last_report_id": 0}
@@ -224,12 +253,9 @@ def run_sync(
             except Exception:
                 last_id = 0
 
-        # counts
-        if template_ids:
+        if tpl_ids:
             total_candidates = int(
-                (conn.execute(SQL_COUNT_CANDIDATES_TPL, (list(legal_forms), list(template_ids))).fetchone() or {"c": 0})[
-                    "c"
-                ]
+                (conn.execute(SQL_COUNT_CANDIDATES_TPL, (list(legal_forms), tpl_ids)).fetchone() or {"c": 0})["c"]
             )
         else:
             total_candidates = int((conn.execute(SQL_COUNT_CANDIDATES, (list(legal_forms),)).fetchone() or {"c": 0})["c"])
@@ -238,7 +264,7 @@ def run_sync(
             "Candidate reports=%d | legal_forms=%s | template_ids=%s | start_last_id=%d",
             total_candidates,
             ",".join(legal_forms),
-            ",".join(map(str, template_ids)) if template_ids else "ALL",
+            ",".join(map(str, tpl_ids)) if tpl_ids else "ALL",
             last_id,
         )
 
@@ -246,17 +272,14 @@ def run_sync(
             if hard_limit is not None and total_reports >= hard_limit:
                 break
 
-            if template_ids:
-                batch = conn.execute(
-                    SQL_FETCH_CANDIDATES_TPL, (list(legal_forms), list(template_ids), last_id, batch_size)
-                ).fetchall()
+            if tpl_ids:
+                batch = conn.execute(SQL_FETCH_CANDIDATES_TPL, (list(legal_forms), tpl_ids, last_id, batch_size)).fetchall()
             else:
                 batch = conn.execute(SQL_FETCH_CANDIDATES, (list(legal_forms), last_id, batch_size)).fetchall()
 
             if not batch:
                 break
 
-            # advance keyset cursor immediately based on fetched rows (resume-safe)
             last_id = int(batch[-1]["report_id"])
 
             with conn.transaction():
@@ -356,7 +379,6 @@ def run_sync(
                         if hard_limit is not None and total_reports >= hard_limit:
                             break
 
-                # persist checkpoint after each committed batch
                 if use_state_cursor:
                     conn.execute(SQL_SET_STATE, (last_id,))
 
