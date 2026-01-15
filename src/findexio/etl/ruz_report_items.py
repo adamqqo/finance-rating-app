@@ -85,14 +85,16 @@ FROM core.ruz_templates
 WHERE id = %s;
 """
 
+# Removed row_text from writes (do not store it; can be derived from template rows).
+# Keep oznacenie as optional lightweight code; if you also want to drop it, remove similarly.
 SQL_UPSERT_ITEM = """
 INSERT INTO core.ruz_report_items (
   report_id, template_id, ico, pravna_forma, obdobie_do,
-  table_idx, table_name, row_number, oznacenie, row_text,
+  table_idx, table_name, row_number, oznacenie,
   period_col, value_num, updated_at
 ) VALUES (
   %(report_id)s, %(template_id)s, %(ico)s, %(pravna_forma)s, %(obdobie_do)s,
-  %(table_idx)s, %(table_name)s, %(row_number)s, %(oznacenie)s, %(row_text)s,
+  %(table_idx)s, %(table_name)s, %(row_number)s, %(oznacenie)s,
   %(period_col)s, %(value_num)s, now()
 )
 ON CONFLICT (report_id, table_idx, row_number, period_col) DO UPDATE SET
@@ -102,7 +104,6 @@ ON CONFLICT (report_id, table_idx, row_number, period_col) DO UPDATE SET
   obdobie_do    = EXCLUDED.obdobie_do,
   table_name    = EXCLUDED.table_name,
   oznacenie     = EXCLUDED.oznacenie,
-  row_text      = EXCLUDED.row_text,
   value_num     = EXCLUDED.value_num,
   updated_at    = now();
 """
@@ -162,8 +163,8 @@ def _extract_table_meta(
     return tname, dc, rows
 
 
-def _index_for(row_number: int, data_cols: int, period_col: int) -> int:
-    return (row_number - 1) * data_cols + (period_col - 1)
+def _index_for(local_row_number: int, data_cols: int, period_col: int) -> int:
+    return (local_row_number - 1) * data_cols + (period_col - 1)
 
 
 def _load_template_payload(tpl_raw: Any, *, template_id: int, report_id: int) -> Optional[Dict[str, Any]]:
@@ -205,7 +206,7 @@ def _normalize_template_ids(template_ids: TemplateIdsType) -> Optional[List[int]
         return None
     if isinstance(template_ids, int):
         return [int(template_ids)]
-    if isinstance(template_ids, tuple) or isinstance(template_ids, list):
+    if isinstance(template_ids, (tuple, list)):
         out: List[int] = []
         for x in template_ids:
             try:
@@ -213,7 +214,6 @@ def _normalize_template_ids(template_ids: TemplateIdsType) -> Optional[List[int]
             except Exception:
                 continue
         return out if out else None
-    # fallback: accept string like "699,687"
     if isinstance(template_ids, str):
         parts = [p.strip() for p in template_ids.split(",")]
         out2: List[int] = []
@@ -226,6 +226,49 @@ def _normalize_template_ids(template_ids: TemplateIdsType) -> Optional[List[int]
                 continue
         return out2 if out2 else None
     return None
+
+
+def _build_rows_meta_with_offset(
+    tpl_rows: List[Dict[str, Any]],
+    max_rows_local: int,
+) -> Tuple[Dict[int, Optional[str]], int, int]:
+    """
+    Returns:
+      - rows_meta_ozn: {global_row_number -> oznacenie}
+      - offset: global = local + offset
+      - max_rows_effective: capped local row count so we don't go past template max row number
+    """
+    rows_meta_ozn: Dict[int, Optional[str]] = {}
+    min_tpl_rn: Optional[int] = None
+    max_tpl_rn: Optional[int] = None
+
+    for rr in tpl_rows:
+        if not isinstance(rr, dict):
+            continue
+        try:
+            rn = int(rr.get("cisloRiadku"))
+        except Exception:
+            continue
+
+        if min_tpl_rn is None or rn < min_tpl_rn:
+            min_tpl_rn = rn
+        if max_tpl_rn is None or rn > max_tpl_rn:
+            max_tpl_rn = rn
+
+        rows_meta_ozn[rn] = _safe_str(rr.get("oznacenie"))
+
+    # Detect tables where template row numbers are globally numbered (e.g., 79..145)
+    offset = 0
+    if min_tpl_rn is not None and min_tpl_rn > 1 and (1 not in rows_meta_ozn):
+        offset = min_tpl_rn - 1
+
+    max_rows_effective = max_rows_local
+    if max_tpl_rn is not None:
+        max_local_allowed = max_tpl_rn - offset
+        if max_local_allowed > 0:
+            max_rows_effective = min(max_rows_effective, max_local_allowed)
+
+    return rows_meta_ozn, offset, max_rows_effective
 
 
 def run_sync(
@@ -323,34 +366,22 @@ def run_sync(
                             if data_cols <= 0:
                                 data_cols = 2
 
-                            rows_meta: Dict[int, Tuple[Optional[str], Optional[str]]] = {}
-                            for rr in tpl_rows:
-                                if not isinstance(rr, dict):
-                                    continue
-                                try:
-                                    rn = int(rr.get("cisloRiadku"))
-                                except Exception:
-                                    continue
-
-                                ozn = _safe_str(rr.get("oznacenie"))
-                                txt = rr.get("text")
-                                row_text: Optional[str] = None
-                                if isinstance(txt, dict):
-                                    row_text = _safe_str(txt.get("sk") or txt.get("en"))
-                                elif isinstance(txt, str):
-                                    row_text = _safe_str(txt)
-
-                                rows_meta[rn] = (ozn, row_text)
-
-                            max_rows = (len(data) // data_cols) if data_cols > 0 else 0
-                            if max_rows <= 0:
+                            max_rows_local = (len(data) // data_cols) if data_cols > 0 else 0
+                            if max_rows_local <= 0:
                                 continue
 
-                            for row_number in range(1, max_rows + 1):
-                                oznacenie, row_text = rows_meta.get(row_number, (None, None))
+                            rows_meta_ozn, offset, max_rows_effective = _build_rows_meta_with_offset(
+                                tpl_rows, max_rows_local
+                            )
+                            if max_rows_effective <= 0:
+                                continue
+
+                            for local_row_number in range(1, max_rows_effective + 1):
+                                row_number = local_row_number + offset  # FIX: global/template row number
+                                oznacenie = rows_meta_ozn.get(row_number)
 
                                 for period_col in range(1, data_cols + 1):
-                                    idx = _index_for(row_number, data_cols, period_col)
+                                    idx = _index_for(local_row_number, data_cols, period_col)
                                     if idx >= len(data):
                                         continue
 
@@ -368,7 +399,6 @@ def run_sync(
                                             "table_name": tname,
                                             "row_number": row_number,
                                             "oznacenie": oznacenie,
-                                            "row_text": row_text,
                                             "period_col": period_col,
                                             "value_num": val_num,
                                         },
