@@ -149,7 +149,6 @@ CREATE TABLE IF NOT EXISTS core.ruz_report_items (
     table_name      TEXT,
     row_number      INTEGER NOT NULL,
     oznacenie       TEXT,
-    row_text        TEXT,
     period_col      SMALLINT NOT NULL, -- 1=current, 2=previous (per template)
     value_num       NUMERIC,
     updated_at      TIMESTAMPTZ DEFAULT now(),
@@ -158,6 +157,7 @@ CREATE TABLE IF NOT EXISTS core.ruz_report_items (
 CREATE INDEX IF NOT EXISTS ix_ritems_ico ON core.ruz_report_items(ico);
 CREATE INDEX IF NOT EXISTS ix_ritems_pravna_forma ON core.ruz_report_items(pravna_forma);
 CREATE INDEX IF NOT EXISTS ix_ritems_obdobie_do ON core.ruz_report_items(obdobie_do);
+
 
 -- =====================
 -- State: ruz_report_items (checkpoint for keyset pagination)
