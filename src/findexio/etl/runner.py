@@ -5,7 +5,7 @@ import os
 import sys
 
 from ..db import get_conn, ensure_schema
-from . import rpo_bulk, ruz_units, ruz_statements, ruz_reports
+from . import rpo_bulk, ruz_units, ruz_statements, ruz_reports, fin_ddl, fin_etl
 from . import ruz_templates, ruz_report_items
 
 
@@ -85,7 +85,8 @@ def daily() -> None:
 
     log.info("Running ruz_report_items (legal_forms=112,121)...")
     ruz_report_items.run_sync(legal_forms=("112", "121")) ##NAPAROVANIE SABLON S OBSAHOM UCTOVNYCH ZAVIEROK
-
+    log.info("Running FIN_ETL...")
+    fin_etl.run()
     log.info("DAILY finished.")
 
 def update02() -> None:
@@ -98,3 +99,34 @@ def update02() -> None:
     ruz_report_items.run_sync(legal_forms=("112", "121"), template_ids=699, hard_limit=20000)
 
     log.info("V0.2 update finished.")
+
+def fin_ddl_run() -> None:
+    """
+    Applies DB objects for financial health pipeline (DDL):
+      - parse_ruztxt_date()
+      - fin_item_map
+      - fin_annual_aggregates
+      - fin_annual_features
+      - fin_health_grade
+      - indexes
+    """
+    ensure_db()
+    log.info("Starting FIN_DDL...")
+    fin_ddl.run()
+    log.info("FIN_DDL finished.")
+
+
+def fin_etl_run() -> None:
+    """
+    Refreshes financial health ETL (DML):
+      aggregates -> features -> grades
+
+    Requires:
+      - ruz_report_items already populated
+      - fin_item_map populated for template 699
+    """
+    ensure_db()
+    log.info("Starting FIN_ETL...")
+    fin_etl.run()
+    log.info("FIN_ETL finished.")
+
