@@ -70,6 +70,12 @@ def main() -> None:
     if args.cmd == "update02":
         runner.update02()
         return
+    if args.cmd == "fin_ddl_run":
+        runner.fin_ddl_run()
+        return
+    if args.cmd == "fin_etl_run":
+        runner.fin_etl_run()
+        return
 
     if args.cmd == "rpo":
         rpo_bulk.run_full_sync(
