@@ -98,7 +98,7 @@ SELECT
     current_liabilities, longterm_liabilities,
     revenue, interest_expense, depreciation, profit_before_tax, net_income
 FROM pivot
-ON CONFLICT (report_id, norm_period) DO UPDATE SET
+ON CONFLICT (ico, fiscal_year, norm_period, report_id) DO UPDATE SET
     ico = EXCLUDED.ico,
     statement_id = EXCLUDED.statement_id,
     template_id = EXCLUDED.template_id,

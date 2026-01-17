@@ -12,165 +12,233 @@ CREATE SCHEMA IF NOT EXISTS core;
 -- =========================
 -- Functions
 -- =========================
-CREATE OR REPLACE FUNCTION core.parse_ruztxt_date(x TEXT)
-RETURNS DATE
-LANGUAGE sql
-IMMUTABLE
-AS $$
-  SELECT CASE
-    WHEN x IS NULL OR btrim(x) = '' THEN NULL
-    WHEN x ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN x::date
-    WHEN x ~ '^\\d{4}-\\d{2}$' THEN (x || '-01')::date + interval '1 month - 1 day'
-    WHEN x ~ '^\\d{4}$' THEN (x || '-12-31')::date
-    ELSE NULL
-  END;
-$$;
+--CREATE OR REPLACE FUNCTION core.parse_ruztxt_date(x TEXT)
+--RETURNS DATE
+--LANGUAGE sql
+--IMMUTABLE
+--AS $$
+--  SELECT CASE
+--    WHEN x IS NULL OR btrim(x) = '' THEN NULL
+--    WHEN x ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN x::date
+--    WHEN x ~ '^\\d{4}-\\d{2}$' THEN (x || '-01')::date + interval '1 month - 1 day'
+--   WHEN x ~ '^\\d{4}$' THEN (x || '-12-31')::date
+--    ELSE NULL
+--  END;
+--$$;
 
 -- =========================
 -- Financial tables
 -- =========================
 
-CREATE TABLE IF NOT EXISTS core.fin_item_map (
-    template_id   BIGINT NOT NULL,
-    table_name    TEXT NOT NULL,
-    row_number    INTEGER NOT NULL,
-    metric_key    TEXT NOT NULL,
-    sign_mult     SMALLINT NOT NULL DEFAULT 1,
-    weight        NUMERIC NOT NULL DEFAULT 1,
-    updated_at    TIMESTAMPTZ DEFAULT now(),
-    PRIMARY KEY (template_id, table_name, row_number, metric_key)
-);
+-- Table: core.fin_item_map
 
-CREATE TABLE IF NOT EXISTS core.fin_annual_aggregates (
-    report_id      BIGINT NOT NULL,
-    norm_period    SMALLINT NOT NULL,  -- 1=current, 2=previous
+-- DROP TABLE IF EXISTS core.fin_item_map;
 
-    ico            TEXT,
-    statement_id   BIGINT,
-    template_id    BIGINT,
+CREATE TABLE IF NOT EXISTS core.fin_item_map
+(
+    id bigint NOT NULL DEFAULT nextval('core.fin_item_map_id_seq'::regclass),
+    template_id bigint,
+    table_name text COLLATE pg_catalog."default",
+    row_number integer,
+    oznacenie text COLLATE pg_catalog."default",
+    metric_key text COLLATE pg_catalog."default" NOT NULL,
+    sign_mult smallint NOT NULL DEFAULT 1,
+    weight numeric NOT NULL DEFAULT 1,
+    note text COLLATE pg_catalog."default",
+    CONSTRAINT fin_item_map_pkey PRIMARY KEY (id),
+    CONSTRAINT fin_item_map_template_id_table_name_row_number_metric_key_key UNIQUE (template_id, table_name, row_number, metric_key)
+)
 
-    period_end     DATE,
-    fiscal_year    INT,
-    currency       TEXT,
-    legal_form     TEXT,
+TABLESPACE pg_default;
 
-    -- Balance sheet
-    total_assets           NUMERIC,
-    equity                 NUMERIC,
-    total_liabilities      NUMERIC,
-    current_assets         NUMERIC,
-    cash                   NUMERIC,
-    receivables            NUMERIC,
-    inventory              NUMERIC,
-    current_liabilities    NUMERIC,
-    longterm_liabilities   NUMERIC,
+ALTER TABLE IF EXISTS core.fin_item_map
+    OWNER to postgres;
+-- Index: ix_fin_item_map_metric
 
-    -- Income statement
-    revenue               NUMERIC,
-    interest_expense      NUMERIC,
-    depreciation          NUMERIC,
-    profit_before_tax     NUMERIC,
-    net_income            NUMERIC,
+-- DROP INDEX IF EXISTS core.ix_fin_item_map_metric;
 
-    updated_at     TIMESTAMPTZ DEFAULT now(),
-    PRIMARY KEY (report_id, norm_period)
-);
+CREATE INDEX IF NOT EXISTS ix_fin_item_map_metric
+    ON core.fin_item_map USING btree
+    (metric_key COLLATE pg_catalog."default" ASC NULLS LAST)
+    WITH (fillfactor=100, deduplicate_items=True)
+    TABLESPACE pg_default;
+-- Index: ix_fin_item_map_tpl
 
-CREATE TABLE IF NOT EXISTS core.fin_annual_features (
-    report_id        BIGINT NOT NULL,
-    norm_period      SMALLINT NOT NULL,
+-- DROP INDEX IF EXISTS core.ix_fin_item_map_tpl;
 
-    ico              TEXT,
-    fiscal_year      INT,
-    statement_id     BIGINT,
-    template_id      BIGINT,
-    period_end       DATE,
-    currency         TEXT,
-    legal_form       TEXT,
+CREATE INDEX IF NOT EXISTS ix_fin_item_map_tpl
+    ON core.fin_item_map USING btree
+    (template_id ASC NULLS LAST)
+    WITH (fillfactor=100, deduplicate_items=True)
+    TABLESPACE pg_default;
 
-    -- Liquidity (robust)
-    current_ratio           NUMERIC,
-    quick_ratio             NUMERIC,
-    cash_ratio              NUMERIC,
-    net_working_capital     NUMERIC,
-    nwc_to_assets           NUMERIC,
-    cash_to_assets          NUMERIC,
+-- Table: core.fin_annual_aggregates
 
-    -- Solvency
-    equity_ratio            NUMERIC,
-    debt_ratio              NUMERIC,
-    debt_to_equity          NUMERIC,
+-- DROP TABLE IF EXISTS core.fin_annual_aggregates;
 
-    -- Profitability
-    roa                     NUMERIC,
-    roe                     NUMERIC,
-    net_margin              NUMERIC,
+CREATE TABLE IF NOT EXISTS core.fin_annual_aggregates
+(
+    ico text COLLATE pg_catalog."default" NOT NULL,
+    report_id bigint NOT NULL,
+    statement_id bigint,
+    template_id bigint,
+    period_end date NOT NULL,
+    fiscal_year integer NOT NULL,
+    currency text COLLATE pg_catalog."default",
+    legal_form text COLLATE pg_catalog."default",
+    total_assets numeric,
+    equity numeric,
+    total_liabilities numeric,
+    current_assets numeric,
+    cash numeric,
+    receivables numeric,
+    inventory numeric,
+    current_liabilities numeric,
+    longterm_liabilities numeric,
+    revenue numeric,
+    ebit numeric,
+    interest_expense numeric,
+    net_income numeric,
+    updated_at timestamp with time zone DEFAULT now(),
+    norm_period smallint NOT NULL,
+    depreciation numeric,
+    profit_before_tax numeric,
+    CONSTRAINT fin_annual_aggregates_pkey PRIMARY KEY (ico, fiscal_year, norm_period, report_id)
+)
 
-    -- Efficiency
-    asset_turnover          NUMERIC,
+TABLESPACE pg_default;
 
-    -- Coverage
-    ebit_proxy              NUMERIC,
-    interest_coverage       NUMERIC,
+ALTER TABLE IF EXISTS core.fin_annual_aggregates
+    OWNER to postgres;
+-- Index: ix_faa_ico_year_norm
 
-    -- Flags
-    negative_equity_flag     BOOLEAN,
-    liquidity_breach_flag    BOOLEAN,
-    high_leverage_flag       BOOLEAN,
-    loss_flag                BOOLEAN,
+-- DROP INDEX IF EXISTS core.ix_faa_ico_year_norm;
 
-    -- Raw refs
-    total_assets             NUMERIC,
-    equity                   NUMERIC,
-    total_liabilities         NUMERIC,
-    current_assets           NUMERIC,
-    current_liabilities       NUMERIC,
-    cash                     NUMERIC,
-    inventory                NUMERIC,
-    receivables              NUMERIC,
-    revenue                  NUMERIC,
-    interest_expense         NUMERIC,
-    depreciation             NUMERIC,
-    profit_before_tax        NUMERIC,
-    net_income               NUMERIC,
-
-    updated_at      TIMESTAMPTZ DEFAULT now(),
-    PRIMARY KEY (report_id, norm_period)
-);
-
-CREATE TABLE IF NOT EXISTS core.fin_health_grade (
-    report_id        BIGINT NOT NULL,
-    norm_period      SMALLINT NOT NULL,
-
-    ico              TEXT,
-    fiscal_year      INT,
-    statement_id     BIGINT,
-    period_end       DATE,
-
-    score_total      NUMERIC,
-    score_capital    NUMERIC,
-    score_profit     NUMERIC,
-    score_liq_bonus  NUMERIC,
-    score_nwc_pen    NUMERIC,
-
-    grade            CHAR(1),
-    reason           TEXT,
-
-    updated_at       TIMESTAMPTZ DEFAULT now(),
-    PRIMARY KEY (report_id, norm_period)
-);
-
--- =========================
--- Indexes
--- =========================
 CREATE INDEX IF NOT EXISTS ix_faa_ico_year_norm
-ON core.fin_annual_aggregates(ico, fiscal_year, norm_period);
+    ON core.fin_annual_aggregates USING btree
+    (ico COLLATE pg_catalog."default" ASC NULLS LAST, fiscal_year ASC NULLS LAST, norm_period ASC NULLS LAST)
+    WITH (fillfactor=100, deduplicate_items=True)
+    TABLESPACE pg_default;
+-- Index: ix_faa_report_norm
 
-CREATE INDEX IF NOT EXISTS ix_faf_ico_year_norm
-ON core.fin_annual_features(ico, fiscal_year, norm_period);
+-- DROP INDEX IF EXISTS core.ix_faa_report_norm;
+
+CREATE INDEX IF NOT EXISTS ix_faa_report_norm
+    ON core.fin_annual_aggregates USING btree
+    (report_id ASC NULLS LAST, norm_period ASC NULLS LAST)
+    WITH (fillfactor=100, deduplicate_items=True)
+    TABLESPACE pg_default;
+-- Index: ix_fin_aggr_report
+
+-- DROP INDEX IF EXISTS core.ix_fin_aggr_report;
+
+CREATE INDEX IF NOT EXISTS ix_fin_aggr_report
+    ON core.fin_annual_aggregates USING btree
+    (report_id ASC NULLS LAST)
+    WITH (fillfactor=100, deduplicate_items=True)
+    TABLESPACE pg_default;
+-- Index: ix_fin_aggr_year
+
+-- DROP INDEX IF EXISTS core.ix_fin_aggr_year;
+
+CREATE INDEX IF NOT EXISTS ix_fin_aggr_year
+    ON core.fin_annual_aggregates USING btree
+    (fiscal_year ASC NULLS LAST)
+    WITH (fillfactor=100, deduplicate_items=True)
+    TABLESPACE pg_default;
+
+-- Table: core.fin_annual_features
+
+-- DROP TABLE IF EXISTS core.fin_annual_features;
+
+CREATE TABLE IF NOT EXISTS core.fin_annual_features
+(
+    report_id bigint NOT NULL,
+    norm_period smallint NOT NULL,
+    ico text COLLATE pg_catalog."default",
+    fiscal_year integer,
+    statement_id bigint,
+    template_id bigint,
+    period_end date,
+    currency text COLLATE pg_catalog."default",
+    legal_form text COLLATE pg_catalog."default",
+    current_ratio numeric,
+    quick_ratio numeric,
+    cash_ratio numeric,
+    equity_ratio numeric,
+    debt_ratio numeric,
+    debt_to_equity numeric,
+    roa numeric,
+    roe numeric,
+    net_margin numeric,
+    asset_turnover numeric,
+    ebit_proxy numeric,
+    interest_coverage numeric,
+    negative_equity_flag boolean,
+    liquidity_breach_flag boolean,
+    high_leverage_flag boolean,
+    loss_flag boolean,
+    total_assets numeric,
+    equity numeric,
+    total_liabilities numeric,
+    current_assets numeric,
+    current_liabilities numeric,
+    cash numeric,
+    inventory numeric,
+    receivables numeric,
+    revenue numeric,
+    interest_expense numeric,
+    depreciation numeric,
+    profit_before_tax numeric,
+    net_income numeric,
+    updated_at timestamp with time zone DEFAULT now(),
+    net_working_capital numeric,
+    nwc_to_assets numeric,
+    cash_to_assets numeric,
+    CONSTRAINT fin_annual_features_pkey PRIMARY KEY (report_id, norm_period)
+)
+
+TABLESPACE pg_default;
+
+ALTER TABLE IF EXISTS core.fin_annual_features
+    OWNER to postgres;
+
+-- Table: core.fin_health_grade
+
+-- DROP TABLE IF EXISTS core.fin_health_grade;
+
+CREATE TABLE IF NOT EXISTS core.fin_health_grade
+(
+    report_id bigint NOT NULL,
+    norm_period smallint NOT NULL,
+    ico text COLLATE pg_catalog."default",
+    fiscal_year integer,
+    statement_id bigint,
+    period_end date,
+    score_total numeric,
+    score_capital numeric,
+    score_profit numeric,
+    score_liq_bonus numeric,
+    score_nwc_pen numeric,
+    grade character(1) COLLATE pg_catalog."default",
+    reason text COLLATE pg_catalog."default",
+    updated_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT fin_health_grade_pkey PRIMARY KEY (report_id, norm_period)
+)
+
+TABLESPACE pg_default;
+
+ALTER TABLE IF EXISTS core.fin_health_grade
+    OWNER to postgres;
+-- Index: ix_fhg_ico_year
+
+-- DROP INDEX IF EXISTS core.ix_fhg_ico_year;
 
 CREATE INDEX IF NOT EXISTS ix_fhg_ico_year
-ON core.fin_health_grade(ico, fiscal_year);
+    ON core.fin_health_grade USING btree
+    (ico COLLATE pg_catalog."default" ASC NULLS LAST, fiscal_year ASC NULLS LAST)
+    WITH (fillfactor=100, deduplicate_items=True)
+    TABLESPACE pg_default;
 """
 
 
