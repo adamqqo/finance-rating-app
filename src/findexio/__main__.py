@@ -24,7 +24,9 @@ def main() -> None:
     sub.add_parser("schema", help="Create/ensure DB schema")
     sub.add_parser("bootstrap", help="RPO (INIT+DAILY) + RUZ pipeline")
     sub.add_parser("daily", help="Cron-friendly daily pipeline")
-    sub.add_parser("update02", help="Update V0.21 only")
+    sub.add_parser("update02", help="Update report items and templates")
+    sub.add_parser("fin_ddl_run", help="DDL Pipeline")
+    sub.add_parser("fin_etl_run", help="ETL Pipeline")
 
     p_rpo = sub.add_parser("rpo", help="Run only RPO bulk sync")
     p_rpo.add_argument("--no-daily", action="store_true")
