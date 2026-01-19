@@ -130,3 +130,54 @@ def fin_etl_run() -> None:
     fin_etl.run()
     log.info("FIN_ETL finished.")
 
+def backfill_report_items_year(*, year: int = 2024) -> None:
+    """
+    One-off backfill of ruz_report_items for a specific year.
+    - Does NOT move ruz_report_items_state.last_report_id
+    - Safe to run multiple times
+    """
+    ensure_db()
+    log.info("Starting BACKFILL ruz_report_items for year=%s", year)
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            WITH latest AS (
+              SELECT
+                r.id AS report_id
+              FROM core.ruz_reports r
+              LEFT JOIN core.ruz_report_items i
+                ON i.report_id = r.id
+              WHERE r.id_sablony = 699
+                AND (r.titulna->>'obdobieDo') LIKE %s
+                AND i.report_id IS NULL
+            )
+            SELECT report_id FROM latest
+            """
+            ,
+            (f"{year}%",)
+        ).fetchall()
+
+    report_ids = [r[0] for r in rows]
+
+    log.info(
+        "Found %s reports from %s without items",
+        len(report_ids),
+        year,
+    )
+
+    if not report_ids:
+        log.info("Nothing to backfill.")
+        return
+
+    ruz_report_items.run_sync(
+        legal_forms=("112", "121"),
+        template_ids=699,
+        report_ids=report_ids,
+        hard_limit=38739,
+        # 🔒 CRITICAL
+        use_state_cursor=False,
+        update_state=False,
+    )
+
+    log.info("BACKFILL %s finished.", year)

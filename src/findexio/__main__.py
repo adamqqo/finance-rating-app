@@ -27,6 +27,7 @@ def main() -> None:
     sub.add_parser("update02", help="Update report items and templates")
     sub.add_parser("fin_ddl_run", help="DDL Pipeline")
     sub.add_parser("fin_etl_run", help="ETL Pipeline")
+    sub.add_parser("backfill-report-items-2024", help="2024 Report Items")
 
     p_rpo = sub.add_parser("rpo", help="Run only RPO bulk sync")
     p_rpo.add_argument("--no-daily", action="store_true")
@@ -77,6 +78,10 @@ def main() -> None:
         runner.fin_etl_run()
         return
 
+    if args.cmd == "backfill-report-items-2024":
+        runner.backfill_report_items_year(year=2024)
+        return
+
     if args.cmd == "rpo":
         rpo_bulk.run_full_sync(
             apply_daily=not args.no_daily,
@@ -94,6 +99,7 @@ def main() -> None:
     if args.cmd == "ruz-statements":
         ruz_statements.run_sync(batch_size=args.batch_size, refresh_all=args.refresh_all, hard_limit=args.hard_limit)
         return
+
 
     if args.cmd == "ruz-reports":
         ruz_reports.run_sync(batch_size=args.batch_size, refresh_all=args.refresh_all, hard_limit=args.hard_limit)
