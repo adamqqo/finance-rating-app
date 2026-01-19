@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from psycopg.rows import dict_row
 
@@ -75,6 +75,36 @@ WHERE r.id_sablony IS NOT NULL
   AND i.report_id IS NULL
   AND r.id_sablony = ANY(%s)
   AND r.id > %s
+ORDER BY r.id
+LIMIT %s;
+"""
+
+# NEW: explicit report_ids backfill mode (does not use state cursor)
+SQL_COUNT_CANDIDATES_BY_IDS = """
+SELECT COUNT(*) AS c
+FROM core.ruz_reports r
+JOIN core.rpo_all_orgs o ON o.ico = r.ico
+LEFT JOIN core.ruz_report_items i ON i.report_id = r.id
+WHERE r.id = ANY(%s)
+  AND o.legal_form_code = ANY(%s)
+  AND r.tabulky IS NOT NULL
+  AND i.report_id IS NULL;
+"""
+
+SQL_FETCH_CANDIDATES_BY_IDS = """
+SELECT r.id AS report_id,
+       r.id_sablony AS template_id,
+       r.ico,
+       o.legal_form_code,
+       r.titulna,
+       r.tabulky
+FROM core.ruz_reports r
+JOIN core.rpo_all_orgs o ON o.ico = r.ico
+LEFT JOIN core.ruz_report_items i ON i.report_id = r.id
+WHERE r.id = ANY(%s)
+  AND o.legal_form_code = ANY(%s)
+  AND r.tabulky IS NOT NULL
+  AND i.report_id IS NULL
 ORDER BY r.id
 LIMIT %s;
 """
@@ -199,6 +229,7 @@ def _load_template_payload(tpl_raw: Any, *, template_id: int, report_id: int) ->
 
 
 TemplateIdsType = Optional[Union[int, Tuple[int, ...], List[int]]]
+ReportIdsType = Optional[Iterable[int]]
 
 
 def _normalize_template_ids(template_ids: TemplateIdsType) -> Optional[List[int]]:
@@ -278,6 +309,8 @@ def run_sync(
     legal_forms: Tuple[str, ...] = LEGAL_FORMS_DEFAULT,
     template_ids: TemplateIdsType = None,
     use_state_cursor: bool = True,
+    report_ids: ReportIdsType = None,
+    update_state: bool = True,
 ) -> None:
     t0 = time.time()
     total_reports = 0
@@ -285,29 +318,46 @@ def run_sync(
 
     tpl_ids = _normalize_template_ids(template_ids)
 
+    # normalize report_ids to list[int] if provided
+    report_ids_list: Optional[List[int]] = None
+    if report_ids is not None:
+        report_ids_list = [int(x) for x in report_ids if x is not None]
+        if not report_ids_list:
+            report_ids_list = []
+
     with get_conn(row_factory=dict_row) as conn:
         ensure_schema(conn)
 
+        # state cursor only applies to NORMAL mode (no explicit report_ids)
         last_id = 0
-        if use_state_cursor:
+        if use_state_cursor and report_ids_list is None:
             st = conn.execute(SQL_GET_STATE).fetchone() or {"last_report_id": 0}
             try:
                 last_id = int(st.get("last_report_id") or 0)
             except Exception:
                 last_id = 0
 
-        if tpl_ids:
+        # candidate count: depends on mode
+        if report_ids_list is not None:
             total_candidates = int(
-                (conn.execute(SQL_COUNT_CANDIDATES_TPL, (list(legal_forms), tpl_ids)).fetchone() or {"c": 0})["c"]
+                (conn.execute(SQL_COUNT_CANDIDATES_BY_IDS, (report_ids_list, list(legal_forms))).fetchone() or {"c": 0})["c"]
             )
         else:
-            total_candidates = int((conn.execute(SQL_COUNT_CANDIDATES, (list(legal_forms),)).fetchone() or {"c": 0})["c"])
+            if tpl_ids:
+                total_candidates = int(
+                    (conn.execute(SQL_COUNT_CANDIDATES_TPL, (list(legal_forms), tpl_ids)).fetchone() or {"c": 0})["c"]
+                )
+            else:
+                total_candidates = int(
+                    (conn.execute(SQL_COUNT_CANDIDATES, (list(legal_forms),)).fetchone() or {"c": 0})["c"]
+                )
 
         log.info(
-            "Candidate reports=%d | legal_forms=%s | template_ids=%s | start_last_id=%d",
+            "Candidate reports=%d | legal_forms=%s | template_ids=%s | mode=%s | start_last_id=%d",
             total_candidates,
             ",".join(legal_forms),
             ",".join(map(str, tpl_ids)) if tpl_ids else "ALL",
+            "report_ids" if report_ids_list is not None else "cursor",
             last_id,
         )
 
@@ -315,14 +365,30 @@ def run_sync(
             if hard_limit is not None and total_reports >= hard_limit:
                 break
 
-            if tpl_ids:
-                batch = conn.execute(SQL_FETCH_CANDIDATES_TPL, (list(legal_forms), tpl_ids, last_id, batch_size)).fetchall()
+            # BACKFILL MODE: explicit report_ids (does not use last_id cursor)
+            if report_ids_list is not None:
+                batch = conn.execute(
+                    SQL_FETCH_CANDIDATES_BY_IDS,
+                    (report_ids_list, list(legal_forms), batch_size),
+                ).fetchall()
+
+            # NORMAL MODE: cursor-based
             else:
-                batch = conn.execute(SQL_FETCH_CANDIDATES, (list(legal_forms), last_id, batch_size)).fetchall()
+                if tpl_ids:
+                    batch = conn.execute(
+                        SQL_FETCH_CANDIDATES_TPL,
+                        (list(legal_forms), tpl_ids, last_id, batch_size),
+                    ).fetchall()
+                else:
+                    batch = conn.execute(
+                        SQL_FETCH_CANDIDATES,
+                        (list(legal_forms), last_id, batch_size),
+                    ).fetchall()
 
             if not batch:
                 break
 
+            # for logging / progress only; state update is conditional below
             last_id = int(batch[-1]["report_id"])
 
             with conn.transaction():
@@ -370,14 +436,12 @@ def run_sync(
                             if max_rows_local <= 0:
                                 continue
 
-                            rows_meta_ozn, offset, max_rows_effective = _build_rows_meta_with_offset(
-                                tpl_rows, max_rows_local
-                            )
+                            rows_meta_ozn, offset, max_rows_effective = _build_rows_meta_with_offset(tpl_rows, max_rows_local)
                             if max_rows_effective <= 0:
                                 continue
 
                             for local_row_number in range(1, max_rows_effective + 1):
-                                row_number = local_row_number + offset  # FIX: global/template row number
+                                row_number = local_row_number + offset  # global/template row number
                                 oznacenie = rows_meta_ozn.get(row_number)
 
                                 for period_col in range(1, data_cols + 1):
@@ -409,25 +473,28 @@ def run_sync(
                         if hard_limit is not None and total_reports >= hard_limit:
                             break
 
-                if use_state_cursor:
+                # Update cursor state ONLY in normal mode (no report_ids) and only if enabled
+                if update_state and use_state_cursor and report_ids_list is None:
                     conn.execute(SQL_SET_STATE, (last_id,))
 
             elapsed = time.time() - t0
             rate_r = total_reports / elapsed if elapsed > 0 else 0.0
             log.info(
-                "Reports=%d/%d | items=%d | last_id=%d | batch=%d | speed=%.2f reports/s",
+                "Reports=%d/%d | items=%d | last_id=%d | batch=%d | speed=%.2f reports/s | mode=%s",
                 total_reports,
                 total_candidates if hard_limit is None else min(total_candidates, hard_limit),
                 total_items,
                 last_id,
                 len(batch),
                 rate_r,
+                "report_ids" if report_ids_list is not None else "cursor",
             )
 
         log.info(
-            "Done. Reports extracted=%d | items=%d | last_id=%d | time=%.1fs",
+            "Done. Reports extracted=%d | items=%d | last_id=%d | time=%.1fs | mode=%s",
             total_reports,
             total_items,
             last_id,
             time.time() - t0,
+            "report_ids" if report_ids_list is not None else "cursor",
         )
