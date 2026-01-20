@@ -304,7 +304,7 @@ def _build_rows_meta_with_offset(
 
 def run_sync(
     *,
-    batch_size: int = 1000,
+    batch_size: int = 100,
     hard_limit: Optional[int] = None,
     legal_forms: Tuple[str, ...] = LEGAL_FORMS_DEFAULT,
     template_ids: TemplateIdsType = None,
