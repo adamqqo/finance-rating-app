@@ -79,7 +79,7 @@ def main() -> None:
         return
 
     if args.cmd == "backfill-report-items-2024":
-        runner.backfill_report_items_year(year=2024)
+        runner.backfill_report_items_year(year=2023)
         return
 
     if args.cmd == "rpo":
