@@ -130,7 +130,7 @@ def fin_etl_run() -> None:
     fin_etl.run()
     log.info("FIN_ETL finished.")
 
-def backfill_report_items_year(*, year: int = 2023) -> None:
+def backfill_report_items_year(*, year: int = 2022) -> None:
     """
     One-off backfill of ruz_report_items for a specific year.
     - Does NOT move ruz_report_items_state.last_report_id
@@ -174,7 +174,7 @@ def backfill_report_items_year(*, year: int = 2023) -> None:
         legal_forms=("112", "121"),
         template_ids=699,
         report_ids=report_ids,
-        hard_limit=42000,
+        hard_limit=50000,
         # 🔒 CRITICAL
         use_state_cursor=False,
         update_state=False,
