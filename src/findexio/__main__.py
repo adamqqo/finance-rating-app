@@ -27,7 +27,9 @@ def main() -> None:
     sub.add_parser("update02", help="Update report items and templates")
     sub.add_parser("fin_ddl_run", help="DDL Pipeline")
     sub.add_parser("fin_etl_run", help="ETL Pipeline")
-    sub.add_parser("backfill-report-items-2024", help="2024 Report Items")
+
+    p_rpi = sub.add_parser("backfill_yearly", help="Specific Year Report Items")
+    p_rpi.add_argument("--year", type=int, help="Year to backfill")
 
     p_rpo = sub.add_parser("rpo", help="Run only RPO bulk sync")
     p_rpo.add_argument("--no-daily", action="store_true")
@@ -78,8 +80,8 @@ def main() -> None:
         runner.fin_etl_run()
         return
 
-    if args.cmd == "backfill-report-items-2024":
-        runner.backfill_report_items_year(year=2023)
+    if args.cmd == "backfill_yearly":
+        runner.backfill_report_items_year(year=args.year)
         return
 
     if args.cmd == "rpo":
