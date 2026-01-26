@@ -267,7 +267,7 @@ def _build_rows_meta_with_offset(
     Returns:
       - rows_meta_ozn: {global_row_number -> oznacenie}
       - offset: global = local + offset
-      - max_rows_effective: capped local row count so we don't go past template max row number
+      - max_rows_effective: capped local row count so we don't go past template max row number :)
     """
     rows_meta_ozn: Dict[int, Optional[str]] = {}
     min_tpl_rn: Optional[int] = None
