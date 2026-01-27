@@ -8,7 +8,7 @@ from .logging_config import setup_logging
 def _lazy_imports():
     # Delay heavier imports until after logging is configured. This prevents
     # module-level log handlers (if any) from attaching to STDERR before we
-    # route logs to STDOUT.
+    # route logs to STDOUT .
     from .db import get_conn, ensure_schema
     from .etl import runner, rpo_bulk, ruz_units, ruz_statements, ruz_reports
 
