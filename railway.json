@@ -10,7 +10,7 @@
   "deploy": {
     "runtime": "V2",
     "numReplicas": 1,
-    "startCommand": "python -m findexio backfill_yearly --year 2021",
+    "startCommand": "python -m findexio backfill_yearly --year 2020",
     "sleepApplication": true,
     "useLegacyStacker": false,
     "multiRegionConfig": {

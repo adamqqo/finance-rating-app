@@ -130,7 +130,7 @@ def fin_etl_run() -> None:
     fin_etl.run()
     log.info("FIN_ETL finished.")
 
-def backfill_report_items_year(*, year: int = 2021) -> None:
+def backfill_report_items_year(*, year: int = 2020) -> None:
     """
     One-off backfill of ruz_report_items for a specific year.
     - Does NOT move ruz_report_items_state.last_report_id
