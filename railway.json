@@ -11,7 +11,7 @@
     "runtime": "V2",
     "numReplicas": 1,
     "startCommand": "python -m findexio fin_etl_run",
-    "sleepApplication": false,
+    "sleepApplication": true,
     "useLegacyStacker": false,
     "multiRegionConfig": {
       "europe-west4-drams3a": {
