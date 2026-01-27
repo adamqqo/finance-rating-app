@@ -451,6 +451,9 @@ def run_sync(
 
                                     val_num = _parse_decimal(data[idx])
 
+                                    if val_num is None:
+                                        continue
+
                                     cur.execute(
                                         SQL_UPSERT_ITEM,
                                         {

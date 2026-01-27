@@ -443,13 +443,33 @@ ON CONFLICT (report_id, norm_period) DO UPDATE SET
     grade = EXCLUDED.grade,
     reason = EXCLUDED.reason,
     updated_at = now();
+    
 """
-
+SQL_DELETE_DUPLICATE_GRADES = """DELETE FROM core.fin_health_grade g
+USING (
+  SELECT report_id, norm_period
+  FROM (
+    SELECT
+      g.report_id,
+      g.norm_period,
+      ROW_NUMBER() OVER (
+        PARTITION BY g.ico, g.fiscal_year
+        ORDER BY g.period_end DESC NULLS LAST, g.report_id DESC
+      ) AS rn
+    FROM core.fin_health_grade g
+    WHERE g.norm_period = 1
+  ) t
+  WHERE t.rn > 1
+) d
+WHERE g.report_id = d.report_id
+  AND g.norm_period = d.norm_period;
+"""
 def run() -> None:
     with get_conn() as conn:
         # jedna transakcia: buď všetko, alebo nič
         conn.execute(SQL_REFRESH_AGGREGATES)
         conn.execute(SQL_REFRESH_FEATURES)
         conn.execute(SQL_REFRESH_GRADES)
+        conn.execute(SQL_DELETE_DUPLICATE_GRADES)
         conn.commit()
     log.info("FIN ETL finished (aggregates -> features -> grades).")
