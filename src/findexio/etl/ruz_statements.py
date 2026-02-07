@@ -120,16 +120,23 @@ def fetch_detail(statement_id: int) -> Dict[str, Any]:
 def prepare_upsert_params(detail: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": detail.get("id"),
-        "id_uctovnej_jednotky": detail.get("idUctovnejJednotky"),
+        # RÚZ API používa `idUJ` (nie idUctovnejJednotky)
+        "id_uctovnej_jednotky": detail.get("idUctovnejJednotky") or detail.get("idUJ"),
+
         "obdobie_od": normalize_date(detail.get("obdobieOd")),
         "obdobie_do": normalize_date(detail.get("obdobieDo")),
-        "druh_zavierky": detail.get("druhZavierky"),
-        "typ_zavierky": detail.get("typZavierky"),
-        "pristupnost_dat": detail.get("pristupnostDat"),
+
+        # RÚZ API používa `typ` (nie typZavierky)
+        "typ_zavierky": detail.get("typZavierky") or detail.get("typ"),
+
+        # tieto polia môžu, ale nemusia byť v odpovedi; nechaj fallbacky
+        "druh_zavierky": detail.get("druhZavierky") or detail.get("druhZavierkyNazov") or detail.get("druh"),
+        "pristupnost_dat": detail.get("pristupnostDat") or detail.get("pristupnost"),
+
         "datum_poslednej_upravy": normalize_date(detail.get("datumPoslednejUpravy")),
         "id_uctovnych_vykazov": Json(detail.get("idUctovnychVykazov") or []),
-        "raw": Json(detail),
     }
+
 
 
 def run_sync(
