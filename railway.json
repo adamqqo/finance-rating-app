@@ -10,7 +10,7 @@
   "deploy": {
     "runtime": "V2",
     "numReplicas": 1,
-    "startCommand": "python -m findexio update02",
+    "startCommand": "python -m findexio daily",
     "sleepApplication": true,
     "useLegacyStacker": false,
     "multiRegionConfig": {

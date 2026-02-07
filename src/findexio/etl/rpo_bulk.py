@@ -508,7 +508,7 @@ def normalize_item(it: Dict[str, Any]) -> Dict[str, Optional[str]]:
     addr_arr = it.get("addresses") or []
     a = _pick_current(addr_arr)
     if isinstance(a, dict):
-        address = a.get("formatedAddress")
+        address = a.get("formattedAddress") or a.get("formatedAddress")
         if not address:
             muni = (a.get("municipality") or {}).get("value")
             pcs = a.get("postalCodes") or []
