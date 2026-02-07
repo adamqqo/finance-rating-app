@@ -5,8 +5,19 @@ import os
 import sys
 
 from ..db import get_conn, ensure_schema
-from . import rpo_bulk, ruz_units, ruz_statements, ruz_reports, fin_ddl, fin_etl
-from . import ruz_templates, ruz_report_items
+from . import (
+    rpo_bulk,
+    ruz_units,
+    ruz_statements,
+    ruz_reports,
+    fin_ddl,
+    fin_etl,
+    ruz_templates,
+    ruz_report_items,
+)
+
+# NEW: Slovensko.Digital (Datahub) enrichment
+from .sd_org import run_sync as sd_org_sync
 
 
 def _setup_logging_if_needed() -> None:
@@ -41,25 +52,31 @@ def bootstrap() -> None:
     Full pipeline run.
 
     Order (dependencies):
-      rpo_bulk -> ruz_units -> ruz_statements -> ruz_reports -> ruz_templates -> ruz_report_items
+      rpo_bulk -> ruz_units -> ruz_statements -> ruz_reports -> ruz_templates -> ruz_report_items -> sd_org
 
-    Note:
-      ruz_report_items is intentionally limited to legal forms 112 (s.r.o.) and 121 (a.s.).
+    Notes:
+      - ruz_report_items is intentionally limited to legal forms 112 (s.r.o.) and 121 (a.s.).
+      - sd_org uses SD/Datahub RPO API; it links by ICO extracted from identifier_entries[].ipo.
     """
     ensure_db()
     log.info("Starting BOOTSTRAP pipeline...")
 
+    # Base registries + RUZ
     rpo_bulk.run_full_sync(apply_daily=False)
     ruz_units.run_sync()
     ruz_statements.run_sync(refresh_all=False)
     ruz_reports.run_sync(refresh_all=False)
 
-    # NEW: templates + exploded report items (BI/ML-ready)
+    # Templates + exploded report items (BI/ML-ready)
     log.info("Running ruz_templates...")
     ruz_templates.run_sync()
 
     log.info("Running ruz_report_items (legal_forms=112,121)...")
     ruz_report_items.run_sync(legal_forms=("112", "121"))
+
+    # SD enrichment (sync endpoint + DB batch upserts; uses cursor sd_since/sd_last_id)
+    log.info("Running sd_org (Slovensko.Digital enrichment)...")
+    sd_org_sync()
 
     log.info("BOOTSTRAP finished.")
 
@@ -69,36 +86,49 @@ def daily() -> None:
     Daily run of the same pipeline.
 
     Note:
-      Keeping the same order ensures templates and report_items stay in sync with newly fetched reports.
+      Keeping the same order ensures templates/report_items stay in sync with newly fetched reports,
+      and SD enrichment runs after base data is present.
     """
     ensure_db()
     log.info("Starting DAILY pipeline...")
 
-    rpo_bulk.run_full_sync(apply_daily=True)   ##REGISTER PRAVNICKYCH OSOB
-    ruz_units.run_sync()                       ##UCTOVNE JEDNOTKY
-    ruz_statements.run_sync(refresh_all=False) ##UCTOVNE ZAVIERKY PRE JEDNOTLIVE UCTOVNE JEDNOTKY
-    ruz_reports.run_sync(refresh_all=False)    ##OBSAH UCTOVNYCH ZAVIEROK
+    rpo_bulk.run_full_sync(apply_daily=True)    # REGISTER PRAVNICKYCH OSOB
+    ruz_units.run_sync()                        # UCTOVNE JEDNOTKY
+    ruz_statements.run_sync(refresh_all=False)  # UCTOVNE ZAVIERKY PRE JEDNOTLIVE UCTOVNE JEDNOTKY
+    ruz_reports.run_sync(refresh_all=False)     # OBSAH UCTOVNYCH ZAVIEROK
 
-    # NEW: templates + exploded report items (BI/ML-ready)
     log.info("Running ruz_templates...")
-    ruz_templates.run_sync()                  ##SABLONY PRE OBSAH UCTOVNYCH ZAVIEROK
+    ruz_templates.run_sync()                    # SABLONY PRE OBSAH UCTOVNYCH ZAVIEROK
 
     log.info("Running ruz_report_items (legal_forms=112,121)...")
-    ruz_report_items.run_sync(legal_forms=("112", "121")) ##NAPAROVANIE SABLON S OBSAHOM UCTOVNYCH ZAVIEROK
+    ruz_report_items.run_sync(legal_forms=("112", "121"))  # NAPAROVANIE SABLON S OBSAHOM UCTOVNYCH ZAVIEROK
+
+    # SD enrichment (incremental)
+    log.info("Running sd_org (Slovensko.Digital enrichment)...")
+    sd_org_sync()
+
     log.info("Running FIN_ETL...")
     fin_etl.run()
+
     log.info("DAILY finished.")
 
+
 def update02() -> None:
-   #V0.2 additions only
+    # V0.2 additions only
     ensure_db()
+
     log.info("Running ruz_templates...")
     ruz_templates.run_sync()
 
     log.info("Running ruz_report_items (legal_forms=112,121)...")
-    ruz_report_items.run_sync(legal_forms=("112", "121"), template_ids=699, hard_limit=100000)
+    ruz_report_items.run_sync(legal_forms=("112", "121"), template_ids=699, hard_limit=50000,use_state_cursor=False)
+
+    # Optional: if you want SD enrichment included in v0.2 update runs
+    log.info("Running sd_org (Slovensko.Digital enrichment)...")
+    sd_org_sync(hard_limit=100000)
 
     log.info("V0.2 update finished.")
+
 
 def fin_ddl_run() -> None:
     """
@@ -130,6 +160,23 @@ def fin_etl_run() -> None:
     fin_etl.run()
     log.info("FIN_ETL finished.")
 
+
+def sd_org_run(*, hard_limit: int | None = None, db_batch_size: int = 200) -> None:
+    """
+    Manual runner for Slovensko.Digital enrichment.
+    - Uses SD sync cursor (sd_since/sd_last_id) stored in core.rpo_bulk_state
+    - Writes into:
+        core.sd_activity_code_dim
+        core.sd_org
+        core.sd_org_address
+        core.sd_org_successor
+    """
+    ensure_db()
+    log.info("Starting SD_ORG sync...")
+    sd_org_sync(hard_limit=hard_limit, db_batch_size=db_batch_size)
+    log.info("SD_ORG sync finished.")
+
+
 def backfill_report_items_year(*, year: int = 2020) -> None:
     """
     One-off backfill of ruz_report_items for a specific year.
@@ -153,18 +200,13 @@ def backfill_report_items_year(*, year: int = 2020) -> None:
                 AND i.report_id IS NULL
             )
             SELECT report_id FROM latest
-            """
-            ,
-            (f"{year}%",)
+            """,
+            (f"{year}%",),
         ).fetchall()
 
     report_ids = [r[0] for r in rows]
 
-    log.info(
-        "Found %s reports from %s without items",
-        len(report_ids),
-        year,
-    )
+    log.info("Found %s reports from %s without items", len(report_ids), year)
 
     if not report_ids:
         log.info("Nothing to backfill.")

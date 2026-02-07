@@ -53,6 +53,7 @@ TABLESPACE pg_default;
 
 ALTER TABLE IF EXISTS core.fin_item_map
     OWNER to postgres;
+
 -- Index: ix_fin_item_map_metric
 
 -- DROP INDEX IF EXISTS core.ix_fin_item_map_metric;
@@ -62,6 +63,7 @@ CREATE INDEX IF NOT EXISTS ix_fin_item_map_metric
     (metric_key COLLATE pg_catalog."default" ASC NULLS LAST)
     WITH (fillfactor=100, deduplicate_items=True)
     TABLESPACE pg_default;
+
 -- Index: ix_fin_item_map_tpl
 
 -- DROP INDEX IF EXISTS core.ix_fin_item_map_tpl;
@@ -110,6 +112,7 @@ TABLESPACE pg_default;
 
 ALTER TABLE IF EXISTS core.fin_annual_aggregates
     OWNER to postgres;
+
 -- Index: ix_faa_ico_year_norm
 
 -- DROP INDEX IF EXISTS core.ix_faa_ico_year_norm;
@@ -119,6 +122,7 @@ CREATE INDEX IF NOT EXISTS ix_faa_ico_year_norm
     (ico COLLATE pg_catalog."default" ASC NULLS LAST, fiscal_year ASC NULLS LAST, norm_period ASC NULLS LAST)
     WITH (fillfactor=100, deduplicate_items=True)
     TABLESPACE pg_default;
+
 -- Index: ix_faa_report_norm
 
 -- DROP INDEX IF EXISTS core.ix_faa_report_norm;
@@ -128,6 +132,7 @@ CREATE INDEX IF NOT EXISTS ix_faa_report_norm
     (report_id ASC NULLS LAST, norm_period ASC NULLS LAST)
     WITH (fillfactor=100, deduplicate_items=True)
     TABLESPACE pg_default;
+
 -- Index: ix_fin_aggr_report
 
 -- DROP INDEX IF EXISTS core.ix_fin_aggr_report;
@@ -137,6 +142,7 @@ CREATE INDEX IF NOT EXISTS ix_fin_aggr_report
     (report_id ASC NULLS LAST)
     WITH (fillfactor=100, deduplicate_items=True)
     TABLESPACE pg_default;
+
 -- Index: ix_fin_aggr_year
 
 -- DROP INDEX IF EXISTS core.ix_fin_aggr_year;
@@ -162,22 +168,30 @@ CREATE TABLE IF NOT EXISTS core.fin_annual_features
     period_end date,
     currency text COLLATE pg_catalog."default",
     legal_form text COLLATE pg_catalog."default",
+
     current_ratio numeric,
     quick_ratio numeric,
     cash_ratio numeric,
+
     equity_ratio numeric,
     debt_ratio numeric,
     debt_to_equity numeric,
+
     roa numeric,
     roe numeric,
     net_margin numeric,
     asset_turnover numeric,
+
     ebit_proxy numeric,
     interest_coverage numeric,
+
+    -- Flags
     negative_equity_flag boolean,
     liquidity_breach_flag boolean,
     high_leverage_flag boolean,
     loss_flag boolean,
+
+    -- Base items (for traceability)
     total_assets numeric,
     equity numeric,
     total_liabilities numeric,
@@ -191,10 +205,25 @@ CREATE TABLE IF NOT EXISTS core.fin_annual_features
     depreciation numeric,
     profit_before_tax numeric,
     net_income numeric,
+
     updated_at timestamp with time zone DEFAULT now(),
+
+    -- Derived liquidity/capital working metrics
     net_working_capital numeric,
     nwc_to_assets numeric,
     cash_to_assets numeric,
+
+    -- =========================================================
+    -- NEW: Slovak discriminant model inputs + outputs (y_SK)
+    -- =========================================================
+    x04_noncurrent_indebtedness numeric,
+    x07_interest_burden numeric,
+    x08_debt_to_cf numeric,
+    x09_equity_leverage numeric,
+    x10_insolvency numeric,
+    model_sk_raw numeric,
+    model_sk_pct numeric,
+
     CONSTRAINT fin_annual_features_pkey PRIMARY KEY (report_id, norm_period)
 )
 
@@ -202,6 +231,13 @@ TABLESPACE pg_default;
 
 ALTER TABLE IF EXISTS core.fin_annual_features
     OWNER to postgres;
+
+-- Helpful index for percentile computations / filtering
+CREATE INDEX IF NOT EXISTS ix_faf_year_modelsk
+    ON core.fin_annual_features USING btree
+    (fiscal_year ASC NULLS LAST, model_sk_raw ASC NULLS LAST)
+    WITH (fillfactor=100, deduplicate_items=True)
+    TABLESPACE pg_default;
 
 -- Table: core.fin_health_grade
 
@@ -215,11 +251,16 @@ CREATE TABLE IF NOT EXISTS core.fin_health_grade
     fiscal_year integer,
     statement_id bigint,
     period_end date,
+
     score_total numeric,
     score_capital numeric,
     score_profit numeric,
     score_liq_bonus numeric,
     score_nwc_pen numeric,
+
+    -- NEW: adjustment from Slovak discriminant model percentile
+    score_model_adj numeric,
+
     grade character(1) COLLATE pg_catalog."default",
     reason text COLLATE pg_catalog."default",
     updated_at timestamp with time zone DEFAULT now(),
@@ -230,6 +271,7 @@ TABLESPACE pg_default;
 
 ALTER TABLE IF EXISTS core.fin_health_grade
     OWNER to postgres;
+
 -- Index: ix_fhg_ico_year
 
 -- DROP INDEX IF EXISTS core.ix_fhg_ico_year;
