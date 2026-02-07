@@ -42,3 +42,8 @@ RPO_S3_ENDPOINT = os.getenv(
     "RPO_S3_ENDPOINT",
     "https://frkqbrydxwdp.compat.objectstorage.eu-frankfurt-1.oraclecloud.com",
 ).rstrip("/")
+
+SD_API_BASE = os.getenv(
+    "SD_API_BASE",
+    "https://datahub.ekosystem.slovensko.digital/api/data/rpo",
+).rstrip("/")

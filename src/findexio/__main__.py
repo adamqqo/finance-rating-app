@@ -11,8 +11,9 @@ def _lazy_imports():
     # route logs to STDOUT .
     from .db import get_conn, ensure_schema
     from .etl import runner, rpo_bulk, ruz_units, ruz_statements, ruz_reports
+    from .etl.sd_org import run_sync as sd_org_sync
 
-    return get_conn, ensure_schema, runner, rpo_bulk, ruz_units, ruz_statements, ruz_reports
+    return get_conn, ensure_schema, runner, rpo_bulk, ruz_units, ruz_statements, ruz_reports, sd_org_sync
 
 
 def main() -> None:
@@ -27,6 +28,16 @@ def main() -> None:
     sub.add_parser("update02", help="Update report items and templates")
     sub.add_parser("fin_ddl_run", help="DDL Pipeline")
     sub.add_parser("fin_etl_run", help="ETL Pipeline")
+
+    # NEW: Slovensko.Digital enrichment
+    p_sd = sub.add_parser("sd-org", help="Run Slovensko.Digital org enrichment (sync + batch upserts)")
+    p_sd.add_argument("--hard-limit", type=int, default=None, help="Max number of orgs to process in this run")
+    p_sd.add_argument("--db-batch-size", type=int, default=200, help="Upsert batch size")
+    p_sd.add_argument(
+        "--reset-cursor",
+        action="store_true",
+        help="Reset SD sync cursor (sd_since=NULL, sd_last_id=0) before running",
+    )
 
     p_rpi = sub.add_parser("backfill_yearly", help="Specific Year Report Items")
     p_rpi.add_argument("--year", type=int, help="Year to backfill")
@@ -55,7 +66,16 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    get_conn, ensure_schema, runner, rpo_bulk, ruz_units, ruz_statements, ruz_reports = _lazy_imports()
+    (
+        get_conn,
+        ensure_schema,
+        runner,
+        rpo_bulk,
+        ruz_units,
+        ruz_statements,
+        ruz_reports,
+        sd_org_sync,
+    ) = _lazy_imports()
 
     if args.cmd == "schema":
         with get_conn() as conn:
@@ -73,11 +93,34 @@ def main() -> None:
     if args.cmd == "update02":
         runner.update02()
         return
+
     if args.cmd == "fin_ddl_run":
         runner.fin_ddl_run()
         return
+
     if args.cmd == "fin_etl_run":
         runner.fin_etl_run()
+        return
+
+    if args.cmd == "sd-org":
+        # ensure schema first (needs sd_since/sd_last_id + sd_* tables)
+        with get_conn() as conn:
+            ensure_schema(conn)
+
+        if args.reset_cursor:
+            with get_conn() as conn:
+                conn.execute(
+                    """
+                    UPDATE core.rpo_bulk_state
+                    SET sd_since = NULL,
+                        sd_last_id = 0,
+                        last_run_at = now()
+                    WHERE id = 1
+                    """
+                )
+                conn.commit()
+
+        sd_org_sync(hard_limit=args.hard_limit, db_batch_size=args.db_batch_size)
         return
 
     if args.cmd == "backfill_yearly":
@@ -101,7 +144,6 @@ def main() -> None:
     if args.cmd == "ruz-statements":
         ruz_statements.run_sync(batch_size=args.batch_size, refresh_all=args.refresh_all, hard_limit=args.hard_limit)
         return
-
 
     if args.cmd == "ruz-reports":
         ruz_reports.run_sync(batch_size=args.batch_size, refresh_all=args.refresh_all, hard_limit=args.hard_limit)

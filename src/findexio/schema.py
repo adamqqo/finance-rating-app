@@ -25,8 +25,20 @@ CREATE TABLE IF NOT EXISTS core.rpo_bulk_state (
     id                  SMALLINT PRIMARY KEY DEFAULT 1,
     last_init_key       TEXT,
     last_daily_key      TEXT,
+
+    -- Slovensko.Digital (Datahub) sync cursor
+    sd_since            TIMESTAMPTZ,
+    sd_last_id          BIGINT,
+
     last_run_at         TIMESTAMPTZ
 );
+
+-- Backward-compatible migrations (safe on existing DBs)
+ALTER TABLE IF EXISTS core.rpo_bulk_state
+  ADD COLUMN IF NOT EXISTS sd_since TIMESTAMPTZ;
+
+ALTER TABLE IF EXISTS core.rpo_bulk_state
+  ADD COLUMN IF NOT EXISTS sd_last_id BIGINT;
 
 INSERT INTO core.rpo_bulk_state (id) VALUES (1)
 ON CONFLICT (id) DO NOTHING;
@@ -171,4 +183,65 @@ CREATE TABLE IF NOT EXISTS core.ruz_report_items_state (
 INSERT INTO core.ruz_report_items_state (id, last_report_id)
 VALUES (1, 0)
 ON CONFLICT (id) DO NOTHING;
+
+-- =========================
+-- SD – Activity code dim
+-- =========================
+CREATE TABLE IF NOT EXISTS core.sd_activity_code_dim (
+    id BIGINT PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ
+);
+
+-- =========================
+-- SD – Organization master
+-- =========================
+CREATE TABLE IF NOT EXISTS core.sd_org (
+    ico BIGINT PRIMARY KEY,
+    sd_org_id BIGINT UNIQUE NOT NULL,
+    established_on DATE,
+    terminated_on DATE,
+    actualized_at TIMESTAMPTZ,
+    main_activity_code_id BIGINT REFERENCES core.sd_activity_code_dim(id),
+    main_activity_code_name TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- =========================
+-- SD – Addresses
+-- =========================
+CREATE TABLE IF NOT EXISTS core.sd_org_address (
+    id BIGSERIAL PRIMARY KEY,
+    ico BIGINT NOT NULL REFERENCES core.sd_org(ico) ON DELETE CASCADE,
+    sd_org_id BIGINT NOT NULL,
+    is_current BOOLEAN NOT NULL DEFAULT FALSE,
+    effective_from DATE,
+    effective_to DATE,
+    street TEXT,
+    building_number TEXT,
+    reg_number INT,
+    postal_code TEXT,
+    municipality TEXT,
+    district TEXT,
+    country TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_sd_org_address_current
+    ON core.sd_org_address (ico, is_current);
+
+-- =========================
+-- SD – Successors
+-- =========================
+CREATE TABLE IF NOT EXISTS core.sd_org_successor (
+    id BIGSERIAL PRIMARY KEY,
+    ico BIGINT NOT NULL REFERENCES core.sd_org(ico) ON DELETE CASCADE,
+    sd_org_id BIGINT NOT NULL,
+    successor_cin BIGINT,
+    successor_name TEXT,
+    successor_established_on DATE,
+    successor_terminated_on DATE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
