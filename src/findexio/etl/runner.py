@@ -123,10 +123,6 @@ def update02() -> None:
     log.info("Running ruz_report_items (legal_forms=112,121)...")
     ruz_report_items.run_sync(legal_forms=("112", "121"), template_ids=699, hard_limit=50000,use_state_cursor=False)
 
-    # Optional: if you want SD enrichment included in v0.2 update runs
-    log.info("Running sd_org (Slovensko.Digital enrichment)...")
-    sd_org_sync(hard_limit=100000)
-
     log.info("V0.2 update finished.")
 
 
