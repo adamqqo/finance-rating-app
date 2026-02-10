@@ -9,19 +9,26 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from psycopg.rows import dict_row
 
-from ..config import SD_API_BASE
 from ..db import get_conn
 
 log = logging.getLogger("findexio.sd_org")
 
+# =========================
+# SD endpoints
+# =========================
+SD_API_BASE = "https://datahub.ekosystem.slovensko.digital/api/data/rpo"
 SYNC_URL = f"{SD_API_BASE}/organizations/sync"
 ORG_URL = f"{SD_API_BASE}/organizations/{{id}}"
 
+# =========================
+# Filter via your own RPO dataset
+# =========================
+ALLOWED_LEGAL_FORMS = ("112", "121")  # s.r.o., a.s.
 
-# -----------------------
-# Sync cursor state
-# -----------------------
 
+# =========================
+# Cursor state in DB (core.rpo_bulk_state)
+# =========================
 @dataclass
 class SdCursor:
     since: str
@@ -29,7 +36,10 @@ class SdCursor:
 
 
 def _get_cursor() -> SdCursor:
-    """Load sync cursor from core.rpo_bulk_state (id=1)."""
+    """
+    Loads SD sync cursor from core.rpo_bulk_state (id=1).
+    Requires columns: sd_since, sd_last_id.
+    """
     with get_conn(row_factory=dict_row) as conn:
         row = conn.execute(
             "SELECT sd_since, sd_last_id FROM core.rpo_bulk_state WHERE id = 1"
@@ -67,20 +77,22 @@ def _set_cursor(cur: SdCursor) -> None:
         conn.commit()
 
 
-# -----------------------
+# =========================
 # HTTP helpers
-# -----------------------
-
+# =========================
 class SdHttpError(RuntimeError):
     pass
 
 
 def _parse_next_link(link_header: Optional[str]) -> Optional[str]:
-    """Extract rel='next' from Link header."""
+    """
+    Extract rel=next from HTTP Link header.
+    Example:
+      Link: <https://.../sync?...>; rel='next'
+    """
     if not link_header:
         return None
 
-    # Link: <https://.../sync?last_id=...&since=...>; rel='next'
     parts = [p.strip() for p in link_header.split(",")]
     for p in parts:
         if "rel='next'" in p or 'rel="next"' in p:
@@ -92,7 +104,9 @@ def _parse_next_link(link_header: Optional[str]) -> Optional[str]:
 
 
 def _throttle_from_headers(resp: requests.Response) -> None:
-    """Respect SD rate limit headers when present."""
+    """
+    Respect SD rate limiting headers if present.
+    """
     try:
         remaining = resp.headers.get("X-RateLimit-Remaining")
         reset = resp.headers.get("X-RateLimit-Reset")
@@ -109,7 +123,7 @@ def _throttle_from_headers(resp: requests.Response) -> None:
         return
 
 
-def _get_list(url: str, *, timeout: int = 30) -> Tuple[List[Dict[str, Any]], requests.Response]:
+def _get_list(url: str, *, timeout: int = 60) -> Tuple[List[Dict[str, Any]], requests.Response]:
     r = requests.get(url, timeout=timeout)
 
     if r.status_code == 429:
@@ -127,11 +141,11 @@ def _get_list(url: str, *, timeout: int = 30) -> Tuple[List[Dict[str, Any]], req
     data = r.json()
     if not isinstance(data, list):
         raise SdHttpError(f"Expected list JSON from {url}, got {type(data)}")
+
     return data, r
 
 
-def _get_obj(url: str, *, timeout: int = 30) -> Tuple[Dict[str, Any], requests.Response]:
-    """GET an endpoint that returns a JSON object (dict)."""
+def _get_obj(url: str, *, timeout: int = 60) -> Tuple[Dict[str, Any], requests.Response]:
     r = requests.get(url, timeout=timeout)
 
     if r.status_code == 429:
@@ -149,13 +163,13 @@ def _get_obj(url: str, *, timeout: int = 30) -> Tuple[Dict[str, Any], requests.R
     data = r.json()
     if not isinstance(data, dict):
         raise SdHttpError(f"Expected object JSON from {url}, got {type(data)}")
+
     return data, r
 
 
-# -----------------------
-# Normalization
-# -----------------------
-
+# =========================
+# Normalization helpers
+# =========================
 def _pick_current_entry(entries: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not entries:
         return None
@@ -167,7 +181,14 @@ def _pick_current_entry(entries: List[Dict[str, Any]]) -> Optional[Dict[str, Any
     return max(entries, key=lambda e: (e.get("effective_to") or "", e.get("effective_from") or ""))
 
 
-def _norm_org(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _norm_org_min(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Minimal org normalization:
+    - extract ICO from identifier_entries[].ipo
+    - extract SD org id
+    - extract dates + activity code
+    Does NOT apply legal form filtering (that is done via rpo_all_orgs).
+    """
     ident = _pick_current_entry(payload.get("identifier_entries") or [])
     if not ident or ident.get("ipo") is None:
         return None
@@ -178,6 +199,8 @@ def _norm_org(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     mac = payload.get("main_activity_code")
     mac_id = mac.get("id") if isinstance(mac, dict) else None
     mac_name = mac.get("name") if isinstance(mac, dict) else None
+    mac_created = mac.get("created_at") if isinstance(mac, dict) else None
+    mac_updated = mac.get("updated_at") if isinstance(mac, dict) else None
 
     return {
         "ico": ico,
@@ -187,8 +210,8 @@ def _norm_org(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "actualized_at": payload.get("actualized_at"),
         "main_activity_code_id": mac_id,
         "main_activity_code_name": mac_name,
-        "main_activity_created_at": mac.get("created_at") if isinstance(mac, dict) else None,
-        "main_activity_updated_at": mac.get("updated_at") if isinstance(mac, dict) else None,
+        "main_activity_created_at": mac_created,
+        "main_activity_updated_at": mac_updated,
     }
 
 
@@ -247,10 +270,34 @@ def _norm_successors(payload: Dict[str, Any], ico: int, sd_org_id: int) -> List[
     return out
 
 
-# -----------------------
-# DB batch upserts
-# -----------------------
+# =========================
+# Filter allowed ICOs via core.rpo_all_orgs
+# =========================
+def _allowed_icos_from_rpo_all_orgs(icos: List[int]) -> set[int]:
+    """
+    Returns ICO set that exists in core.rpo_all_orgs AND has legal_form_code in (112,121).
+    If an ICO isn't in rpo_all_orgs, it will NOT be allowed (strict enrichment policy).
+    """
+    if not icos:
+        return set()
 
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT ico
+            FROM core.rpo_all_orgs
+            WHERE ico = ANY(%s)
+              AND legal_form_code = ANY(%s)
+            """,
+            (icos, list(ALLOWED_LEGAL_FORMS)),
+        ).fetchall()
+
+    return {int(r[0]) for r in rows}
+
+
+# =========================
+# DB upserts (batch)
+# =========================
 SQL_UPSERT_ACTIVITY = """
 INSERT INTO core.sd_activity_code_dim (id, name, created_at, updated_at)
 VALUES (%(id)s, %(name)s, %(created_at)s, %(updated_at)s)
@@ -278,6 +325,7 @@ ON CONFLICT (ico) DO UPDATE SET
   updated_at = now();
 """
 
+# Assumes schema has UNIQUE(sd_address_entry_id)
 SQL_UPSERT_ADDRESS = """
 INSERT INTO core.sd_org_address (
   ico, sd_org_id, sd_address_entry_id, is_current,
@@ -306,6 +354,7 @@ ON CONFLICT (sd_address_entry_id) DO UPDATE SET
   country = EXCLUDED.country;
 """
 
+# Assumes schema has UNIQUE(sd_successor_entry_id)
 SQL_UPSERT_SUCCESSOR = """
 INSERT INTO core.sd_org_successor (
   ico, sd_org_id, sd_successor_entry_id,
@@ -341,41 +390,125 @@ def _db_upsert_batch(
         with conn.cursor() as cur:
             if activity_rows:
                 cur.executemany(SQL_UPSERT_ACTIVITY, activity_rows)
+
             if org_rows:
                 cur.executemany(SQL_UPSERT_ORG, org_rows)
+
             if address_rows:
+                # reset current flags only for touched ICOs
                 ico_set = sorted({r["ico"] for r in address_rows})
                 cur.execute(
                     "UPDATE core.sd_org_address SET is_current = FALSE WHERE ico = ANY(%s)",
                     (ico_set,),
                 )
                 cur.executemany(SQL_UPSERT_ADDRESS, address_rows)
+
             if successor_rows:
                 cur.executemany(SQL_UPSERT_SUCCESSOR, successor_rows)
+
         conn.commit()
 
 
-# -----------------------
+# =========================
 # Main sync loop
-# -----------------------
-
+# =========================
 def _build_sync_url(since: str, last_id: int) -> str:
+    # only_ids -> returns just list of objects with id/updated_at (fast)
     return f"{SYNC_URL}?since={since}&last_id={last_id}&only_ids"
 
 
-def run_sync(*, hard_limit: Optional[int] = None, db_batch_size: int = 200) -> None:
+def run_sync(*, hard_limit: Optional[int] = None, db_batch_size: int = 200) -> int:
+    """
+    SD incremental sync:
+      - pull changed IDs from /sync?since=...&last_id=...&only_ids
+      - fetch each /organizations/:id detail
+      - extract ICO (identifier_entries[].ipo)
+      - FILTER using core.rpo_all_orgs.legal_form_code IN ('112','121')
+      - batch upsert into:
+          core.sd_activity_code_dim
+          core.sd_org
+          core.sd_org_address
+          core.sd_org_successor
+      - persist cursor in core.rpo_bulk_state (sd_since, sd_last_id)
+
+    Returns number of processed (allowed) orgs written to DB.
+    """
     cursor = _get_cursor()
     log.info("SD sync starting from since=%s last_id=%s", cursor.since, cursor.last_id)
 
+    t0 = time.time()
+    processed_allowed = 0
+    fetched_details = 0
+    skipped_no_ico = 0
+    skipped_not_allowed = 0
+
     next_url = _build_sync_url(cursor.since, cursor.last_id)
-    processed = 0
 
-    org_rows: List[Dict[str, Any]] = []
-    activity_rows: List[Dict[str, Any]] = []
-    address_rows: List[Dict[str, Any]] = []
-    successor_rows: List[Dict[str, Any]] = []
-
+    # pending: list of (item, payload, org_min)
+    pending: List[Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]] = []
     last_seen: Optional[SdCursor] = None
+
+    def rate() -> float:
+        elapsed = max(1e-6, time.time() - t0)
+        return processed_allowed / elapsed
+
+    def flush_pending() -> None:
+        nonlocal processed_allowed, skipped_not_allowed
+
+        if not pending:
+            return
+
+        # filter ICOs via your own registry table
+        icos = [p[2]["ico"] for p in pending]
+        allowed = _allowed_icos_from_rpo_all_orgs(icos)
+
+        org_rows: List[Dict[str, Any]] = []
+        activity_rows: List[Dict[str, Any]] = []
+        address_rows: List[Dict[str, Any]] = []
+        successor_rows: List[Dict[str, Any]] = []
+
+        for _item, payload, org_min in pending:
+            ico = org_min["ico"]
+            if ico not in allowed:
+                skipped_not_allowed += 1
+                continue
+
+            # activity dim row
+            if org_min.get("main_activity_code_id") is not None:
+                activity_rows.append(
+                    {
+                        "id": org_min["main_activity_code_id"],
+                        "name": org_min.get("main_activity_code_name"),
+                        "created_at": org_min.get("main_activity_created_at"),
+                        "updated_at": org_min.get("main_activity_updated_at"),
+                    }
+                )
+
+            # org row
+            org_rows.append(
+                {
+                    "ico": ico,
+                    "sd_org_id": org_min["sd_org_id"],
+                    "established_on": org_min.get("established_on"),
+                    "terminated_on": org_min.get("terminated_on"),
+                    "actualized_at": org_min.get("actualized_at"),
+                    "main_activity_code_id": org_min.get("main_activity_code_id"),
+                    "main_activity_code_name": org_min.get("main_activity_code_name"),
+                }
+            )
+
+            address_rows.extend(_norm_addresses(payload, ico, org_min["sd_org_id"]))
+            successor_rows.extend(_norm_successors(payload, ico, org_min["sd_org_id"]))
+            processed_allowed += 1
+
+        _db_upsert_batch(
+            org_rows=org_rows,
+            activity_rows=activity_rows,
+            address_rows=address_rows,
+            successor_rows=successor_rows,
+        )
+
+        pending.clear()
 
     while next_url:
         items, resp = _get_list(next_url, timeout=60)
@@ -392,82 +525,70 @@ def run_sync(*, hard_limit: Optional[int] = None, db_batch_size: int = 200) -> N
 
             try:
                 payload, _ = _get_obj(detail_url, timeout=60)
+                fetched_details += 1
             except Exception as e:
                 log.warning("SD detail fetch failed id=%s: %s", sd_org_id, e)
                 continue
 
-            org = _norm_org(payload)
-            if org is None:
+            org_min = _norm_org_min(payload)
+            if org_min is None:
+                skipped_no_ico += 1
                 continue
 
-            ico = org["ico"]
-            sd_org_id = org["sd_org_id"]
-
-            if org.get("main_activity_code_id") is not None:
-                activity_rows.append(
-                    {
-                        "id": org["main_activity_code_id"],
-                        "name": org.get("main_activity_code_name"),
-                        "created_at": org.get("main_activity_created_at"),
-                        "updated_at": org.get("main_activity_updated_at"),
-                    }
-                )
-
-            org_rows.append(
-                {
-                    "ico": ico,
-                    "sd_org_id": sd_org_id,
-                    "established_on": org.get("established_on"),
-                    "terminated_on": org.get("terminated_on"),
-                    "actualized_at": org.get("actualized_at"),
-                    "main_activity_code_id": org.get("main_activity_code_id"),
-                    "main_activity_code_name": org.get("main_activity_code_name"),
-                }
-            )
-
-            address_rows.extend(_norm_addresses(payload, ico, sd_org_id))
-            successor_rows.extend(_norm_successors(payload, ico, sd_org_id))
-
-            processed += 1
+            pending.append((item, payload, org_min))
 
             upd = item.get("updated_at")
             if upd:
                 last_seen = SdCursor(since=str(upd), last_id=int(item["id"]))
 
-            if processed % db_batch_size == 0:
-                _db_upsert_batch(
-                    org_rows=org_rows,
-                    activity_rows=activity_rows,
-                    address_rows=address_rows,
-                    successor_rows=successor_rows,
-                )
-                org_rows.clear()
-                activity_rows.clear()
-                address_rows.clear()
-                successor_rows.clear()
-
+            # flush by batch size of pending details
+            if len(pending) >= db_batch_size:
+                flush_pending()
                 if last_seen:
                     _set_cursor(last_seen)
 
-            if hard_limit is not None and processed >= hard_limit:
-                log.info("SD hard_limit reached: %s", hard_limit)
+                elapsed = time.time() - t0
+                log.info(
+                    "SD progress: allowed=%s fetched=%s skipped_no_ico=%s skipped_not_allowed=%s "
+                    "elapsed=%.1fs rate=%.2f org/s cursor(last_id=%s since=%s)",
+                    processed_allowed,
+                    fetched_details,
+                    skipped_no_ico,
+                    skipped_not_allowed,
+                    elapsed,
+                    rate(),
+                    last_seen.last_id if last_seen else None,
+                    last_seen.since if last_seen else None,
+                )
+
+            if hard_limit is not None and processed_allowed >= hard_limit:
+                log.info("SD hard_limit reached (allowed processed): %s", hard_limit)
                 next_url = None
                 break
 
-        if hard_limit is not None and processed >= hard_limit:
+        if hard_limit is not None and processed_allowed >= hard_limit:
             break
 
         next_url = _parse_next_link(resp.headers.get("Link"))
+
+        # if no next, persist cursor now (even if pending exists)
         if not next_url and last_seen:
             _set_cursor(last_seen)
 
-    _db_upsert_batch(
-        org_rows=org_rows,
-        activity_rows=activity_rows,
-        address_rows=address_rows,
-        successor_rows=successor_rows,
-    )
+    # final flush
+    flush_pending()
     if last_seen:
         _set_cursor(last_seen)
 
-    log.info("SD sync done. processed=%s", processed)
+    elapsed = time.time() - t0
+    log.info(
+        "SD sync done. allowed=%s fetched=%s skipped_no_ico=%s skipped_not_allowed=%s elapsed=%.1fs rate=%.2f org/s",
+        processed_allowed,
+        fetched_details,
+        skipped_no_ico,
+        skipped_not_allowed,
+        elapsed,
+        processed_allowed / max(1e-6, elapsed),
+    )
+
+    return processed_allowed
