@@ -65,7 +65,7 @@ def bootstrap() -> None:
     rpo_bulk.run_full_sync(apply_daily=False)
     ruz_units.run_sync()
     ruz_statements.run_sync(refresh_all=False)
-    ruz_reports.run_sync(refresh_all=False)
+    ruz_reports.run_sync(refresh_all=False,template_id_only=699)
 
     # Templates + exploded report items (BI/ML-ready)
     log.info("Running ruz_templates...")
@@ -95,7 +95,7 @@ def daily() -> None:
     rpo_bulk.run_full_sync(apply_daily=True)    # REGISTER PRAVNICKYCH OSOB
     ruz_units.run_sync()                        # UCTOVNE JEDNOTKY
     ruz_statements.run_sync(refresh_all=False)  # UCTOVNE ZAVIERKY PRE JEDNOTLIVE UCTOVNE JEDNOTKY
-    ruz_reports.run_sync(refresh_all=False)     # OBSAH UCTOVNYCH ZAVIEROK
+    ruz_reports.run_sync(refresh_all=False,template_id_only=699)     # OBSAH UCTOVNYCH ZAVIEROK
 
     log.info("Running ruz_templates...")
     ruz_templates.run_sync()                    # SABLONY PRE OBSAH UCTOVNYCH ZAVIEROK
