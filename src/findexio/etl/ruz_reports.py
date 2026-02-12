@@ -164,9 +164,9 @@ def iter_rows_from_obsah(detail: Dict[str, Any]) -> Iterator[tuple]:
             yield (table_name, idx, row_key, row_name, cells)
 
 
-def run_sync(*, batch_size: int = 1000, refresh_all: bool = False, hard_limit: Optional[int] = None) -> None:
+def run_sync(*, batch_size: int = 1000, refresh_all: bool = False, hard_limit: Optional[int] = None, template_id_only: Optional[int] = None,) -> None:
     t0 = time.time()
-    total, skipped_tombstone, skipped_empty = 0, 0, 0
+    total, skipped_tombstone, skipped_empty, skipped_template = 0, 0, 0, 0
     offset = 0
 
     with get_conn(row_factory=dict_row) as conn:
@@ -192,6 +192,10 @@ def run_sync(*, batch_size: int = 1000, refresh_all: bool = False, hard_limit: O
 
                     if _is_tombstone(d):
                         skipped_tombstone += 1
+                        continue
+
+                    if template_id_only is not None and d.get("idSablony") != template_id_only:
+                        skipped_template += 1
                         continue
 
                     try:
@@ -220,13 +224,19 @@ def run_sync(*, batch_size: int = 1000, refresh_all: bool = False, hard_limit: O
             offset += len(ids)
             elapsed = time.time() - t0
             rate = total / elapsed if elapsed > 0 else 0.0
-            log.info("Processed=%d/%d | offset=%d | batch=%d | speed=%.2f/s | tombstones=%d | empty=%d",
-                     total,
-                     total_candidates if hard_limit is None else min(total_candidates, hard_limit),
-                     offset, len(ids), rate, skipped_tombstone, skipped_empty)
+            log.info(
+                "Processed=%d/%d | offset=%d | batch=%d | speed=%.2f/s | tombstones=%d | empty=%d | wrong_template=%d",
+                total,
+                total_candidates if hard_limit is None else min(total_candidates, hard_limit),
+                offset, len(ids), rate,
+                skipped_tombstone, skipped_empty, skipped_template
+            )
 
             if hard_limit is not None and total >= hard_limit:
                 break
 
-        log.info("Done. Stored reports=%d | tombstones=%d | empty=%d | time=%.1fs",
-                 total, skipped_tombstone, skipped_empty, time.time() - t0)
+        log.info(
+            "Done. Stored reports=%d | tombstones=%d | empty=%d | wrong_template=%d | time=%.1fs",
+            total, skipped_tombstone, skipped_empty, skipped_template, time.time() - t0
+        )
+
