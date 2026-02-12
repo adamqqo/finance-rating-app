@@ -121,7 +121,7 @@ def update02() -> None:
     ruz_templates.run_sync()
 
     log.info("Running ruz_report_items (legal_forms=112,121)...")
-    ruz_report_items.run_sync(legal_forms=("112", "121"), template_ids=699, hard_limit=500,use_state_cursor=False)
+    ruz_report_items.run_sync(legal_forms=("112", "121"), template_ids=699, hard_limit=50000,use_state_cursor=False)
 
     log.info("V0.2 update finished.")
 
