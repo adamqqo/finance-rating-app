@@ -84,11 +84,11 @@ SQL_COUNT_CANDIDATES_BY_IDS = """
 SELECT COUNT(*) AS c
 FROM core.ruz_reports r
 JOIN core.rpo_all_orgs o ON o.ico = r.ico
-LEFT JOIN core.ruz_report_items i ON i.report_id = r.id
 WHERE r.id = ANY(%s)
   AND o.legal_form_code = ANY(%s)
   AND r.tabulky IS NOT NULL
-  AND i.report_id IS NULL;
+  AND NOT EXISTS (
+      SELECT 1 FROM core.ruz_report_items i WHERE i.report_id = r.id);
 """
 
 SQL_FETCH_CANDIDATES_BY_IDS = """
@@ -100,11 +100,12 @@ SELECT r.id AS report_id,
        r.tabulky
 FROM core.ruz_reports r
 JOIN core.rpo_all_orgs o ON o.ico = r.ico
-LEFT JOIN core.ruz_report_items i ON i.report_id = r.id
 WHERE r.id = ANY(%s)
   AND o.legal_form_code = ANY(%s)
   AND r.tabulky IS NOT NULL
-  AND i.report_id IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM core.ruz_report_items i WHERE i.report_id = r.id
+  )
 ORDER BY r.id
 LIMIT %s;
 """
