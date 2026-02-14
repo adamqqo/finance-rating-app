@@ -110,19 +110,25 @@ CREATE TABLE IF NOT EXISTS core.ruz_reports (
 CREATE INDEX IF NOT EXISTS ix_ruz_reports_ico  ON core.ruz_reports(ico);
 CREATE INDEX IF NOT EXISTS ix_ruz_reports_year ON core.ruz_reports(((titulna->>'obdobieDo')));
 
--- (Voliteľné) row-level staging, ak používaš
-CREATE TABLE IF NOT EXISTS core.ruz_report_rows (
-    row_id        BIGSERIAL PRIMARY KEY,
-    report_id     BIGINT NOT NULL,
-    table_name    TEXT,
-    row_idx       INTEGER,
-    row_key       TEXT,
-    row_name      TEXT,
-    cells         JSONB,
-    updated_at    TIMESTAMPTZ DEFAULT now()
+CREATE TABLE IF NOT EXISTS core.ruz_reports_sync_state (
+  id            int PRIMARY KEY,
+  last_report_id bigint NOT NULL DEFAULT 0,
+  updated_at    timestamptz NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS ix_rrows_report ON core.ruz_report_rows(report_id);
-CREATE INDEX IF NOT EXISTS ix_rrows_table  ON core.ruz_report_rows(report_id, table_name);
+
+INSERT INTO core.ruz_reports_sync_state (id, last_report_id)
+VALUES (1, 0)
+ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS core.ruz_report_template_map (
+  report_id   bigint PRIMARY KEY,
+  id_sablony  int,
+  tombstone   boolean NOT NULL DEFAULT false,
+  fetched_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS ix_ruz_template_map_sablony ON core.ruz_report_template_map (id_sablony);
+
 
 -- =====================
 -- RÚZ: Templates (šablóny)
