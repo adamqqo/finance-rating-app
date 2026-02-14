@@ -19,6 +19,44 @@ REQUEST_TIMEOUT = DEFAULT_TIMEOUT
 
 log = logging.getLogger("findexio.ruz_reports")
 
+SQL_GET_STATE = "SELECT last_report_id FROM core.ruz_reports_sync_state WHERE id = 1;"
+SQL_SET_STATE = "UPDATE core.ruz_reports_sync_state SET last_report_id = %s, updated_at = now() WHERE id = 1;"
+
+SQL_FETCH_BATCH_ALL_CURSOR = """
+SELECT DISTINCT t.x::bigint AS report_id
+FROM core.ruz_statements s
+CROSS JOIN LATERAL jsonb_array_elements_text(s.id_uctovnych_vykazov) AS t(x)
+WHERE t.x::bigint > %s
+ORDER BY t.x::bigint
+LIMIT %s;
+"""
+
+SQL_FETCH_BATCH_MISSING_CURSOR = """
+SELECT DISTINCT t.x::bigint AS report_id
+FROM core.ruz_statements s
+CROSS JOIN LATERAL jsonb_array_elements_text(s.id_uctovnych_vykazov) AS t(x)
+LEFT JOIN core.ruz_reports r ON r.id = t.x::bigint
+WHERE t.x::bigint > %s
+  AND r.id IS NULL
+ORDER BY t.x::bigint
+LIMIT %s;
+"""
+
+SQL_GET_TEMPLATE_MAP = """
+SELECT id_sablony, tombstone
+FROM core.ruz_report_template_map
+WHERE report_id = %s;
+"""
+
+SQL_UPSERT_TEMPLATE_MAP = """
+INSERT INTO core.ruz_report_template_map (report_id, id_sablony, tombstone, fetched_at)
+VALUES (%s, %s, %s, now())
+ON CONFLICT (report_id) DO UPDATE SET
+  id_sablony = EXCLUDED.id_sablony,
+  tombstone = EXCLUDED.tombstone,
+  fetched_at = now();
+"""
+
 SQL_COUNT_MISSING = """
 SELECT COUNT(*) AS c
 FROM core.ruz_statements s
@@ -164,71 +202,111 @@ def iter_rows_from_obsah(detail: Dict[str, Any]) -> Iterator[tuple]:
             yield (table_name, idx, row_key, row_name, cells)
 
 
-def run_sync(*, batch_size: int = 1000, refresh_all: bool = False, hard_limit: Optional[int] = None, template_id_only: Optional[int] = None,) -> None:
+def run_sync(
+    *,
+    batch_size: int = 1000,
+    refresh_all: bool = False,
+    hard_limit: Optional[int] = None,
+    template_id_only: Optional[int] = None,
+    use_template_cache: bool = True,
+    reset_cursor: bool = False,
+) -> None:
     t0 = time.time()
     total, skipped_tombstone, skipped_empty, skipped_template = 0, 0, 0, 0
-    offset = 0
+    http_ok, http_fail = 0, 0
 
     with get_conn(row_factory=dict_row) as conn:
         ensure_schema(conn)
 
-        total_candidates = int((conn.execute(SQL_COUNT_ALL if refresh_all else SQL_COUNT_MISSING).fetchone() or {"c": 0})["c"])
-        log.info("Candidates=%d (refresh_all=%s)", total_candidates, refresh_all)
+        if reset_cursor:
+            conn.execute(SQL_SET_STATE, (0,))
+            conn.commit()
+
+        last_id = int((conn.execute(SQL_GET_STATE).fetchone() or {"last_report_id": 0})["last_report_id"])
+        log.info("Start cursor last_id=%d | refresh_all=%s | template_id_only=%s", last_id, refresh_all, template_id_only)
 
         while True:
-            rows = conn.execute(SQL_FETCH_BATCH_ALL if refresh_all else SQL_FETCH_BATCH_MISSING, (batch_size, offset)).fetchall()
+            rows = conn.execute(
+                SQL_FETCH_BATCH_ALL_CURSOR if refresh_all else SQL_FETCH_BATCH_MISSING_CURSOR,
+                (last_id, batch_size),
+            ).fetchall()
             if not rows:
                 break
 
             ids = [int(r["report_id"]) for r in rows]
+            batch_max = ids[-1]
 
             with conn.transaction():
                 for rid in ids:
+                    # 1) cache skip (ak je zapnuté)
+                    if use_template_cache:
+                        m = conn.execute(SQL_GET_TEMPLATE_MAP, (rid,)).fetchone()
+                        if m:
+                            if m["tombstone"]:
+                                skipped_tombstone += 1
+                                continue
+                            if template_id_only is not None and m["id_sablony"] != template_id_only:
+                                skipped_template += 1
+                                continue
+
+                    # 2) HTTP fetch
                     try:
                         d = fetch_detail(rid)
+                        http_ok += 1
                     except Exception as e:
+                        http_fail += 1
                         log.warning("HTTP detail failed (id=%s): %s", rid, e)
                         continue
 
-                    if _is_tombstone(d):
+                    is_tomb = _is_tombstone(d)
+                    sabl = d.get("idSablony")
+
+                    # 3) upsert mapu hneď po fetchnutí (aby sa nabudúce skipovalo bez HTTP)
+                    if use_template_cache:
+                        conn.execute(SQL_UPSERT_TEMPLATE_MAP, (rid, sabl, is_tomb))
+
+                    if is_tomb:
                         skipped_tombstone += 1
                         continue
 
-                    if template_id_only is not None and d.get("idSablony") != template_id_only:
+                    if template_id_only is not None and sabl != template_id_only:
                         skipped_template += 1
                         continue
 
+                    # 4) DB write (len pre “správne” reporty)
                     try:
-                        with conn.transaction():
-                            params = prep_upsert(d)
-                            with conn.cursor() as curu:
-                                curu.execute(SQL_UPSERT_REPORT, params)
+                        params = prep_upsert(d)
+                        with conn.cursor() as curu:
+                            curu.execute(SQL_UPSERT_REPORT, params)
 
-                            tables = (d.get("obsah") or {}).get("tabulky")
-                            if not isinstance(tables, list):
-                                skipped_empty += 1
-                                continue
+                        tables = (d.get("obsah") or {}).get("tabulky")
+                        if not isinstance(tables, list):
+                            skipped_empty += 1
+                            continue
 
-                            with conn.cursor() as curd:
-                                curd.execute(SQL_DELETE_ROWS_FOR_REPORT, (rid,))
-                                for table_name, row_idx, row_key, row_name, cells in iter_rows_from_obsah(d):
-                                    curd.execute(SQL_INSERT_ROW, (rid, table_name, row_idx, row_key, row_name, Json(cells)))
+                        with conn.cursor() as curd:
+                            curd.execute(SQL_DELETE_ROWS_FOR_REPORT, (rid,))
+                            for table_name, row_idx, row_key, row_name, cells in iter_rows_from_obsah(d):
+                                curd.execute(SQL_INSERT_ROW, (rid, table_name, row_idx, row_key, row_name, Json(cells)))
 
-                            total += 1
+                        total += 1
                     except Exception as e:
                         log.error("DB write failed (report_id=%s): %s", rid, e)
 
                     if hard_limit is not None and total >= hard_limit:
                         break
 
-            offset += len(ids)
+                # posuň cursor aj keď sa nič neuložilo (ináč sa zasekneš na wrong_template)
+                conn.execute(SQL_SET_STATE, (batch_max,))
+                last_id = batch_max
+
             elapsed = time.time() - t0
-            rate = total / elapsed if elapsed > 0 else 0.0
+            store_rate = total / elapsed if elapsed > 0 else 0.0
+            http_rate = http_ok / elapsed if elapsed > 0 else 0.0
+
             log.info(
-                "Processed=%d/%d | offset=%d | batch=%d | speed=%.2f/s | tombstones=%d | empty=%d | wrong_template=%d",
-                total,
-                total_candidates if hard_limit is None else min(total_candidates, hard_limit),
-                offset, len(ids), rate,
+                "Stored=%d | cursor=%d | batch=%d | store_speed=%.2f/s | http_ok=%d http_fail=%d http_speed=%.2f/s | tomb=%d | empty=%d | wrong_template=%d",
+                total, last_id, len(ids), store_rate, http_ok, http_fail, http_rate,
                 skipped_tombstone, skipped_empty, skipped_template
             )
 
@@ -236,7 +314,8 @@ def run_sync(*, batch_size: int = 1000, refresh_all: bool = False, hard_limit: O
                 break
 
         log.info(
-            "Done. Stored reports=%d | tombstones=%d | empty=%d | wrong_template=%d | time=%.1fs",
-            total, skipped_tombstone, skipped_empty, skipped_template, time.time() - t0
+            "Done. Stored=%d | http_ok=%d http_fail=%d | tomb=%d | empty=%d | wrong_template=%d | time=%.1fs | last_id=%d",
+            total, http_ok, http_fail, skipped_tombstone, skipped_empty, skipped_template, time.time() - t0, last_id
         )
+
 
