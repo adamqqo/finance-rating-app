@@ -15,6 +15,7 @@ from . import (
     ruz_templates,
     ruz_report_items,
 )
+from ..ml.pd_model import run as ml_pd_run
 
 # NEW: Slovensko.Digital (Datahub) enrichment
 from .sd_org import run_sync as sd_org_sync
@@ -92,16 +93,16 @@ def daily() -> None:
     ensure_db()
     log.info("Starting DAILY pipeline...")
 
-    rpo_bulk.run_full_sync(apply_daily=True)    # REGISTER PRAVNICKYCH OSOB
-    ruz_units.run_sync()                        # UCTOVNE JEDNOTKY
-    ruz_statements.run_sync(refresh_all=False)  # UCTOVNE ZAVIERKY PRE JEDNOTLIVE UCTOVNE JEDNOTKY
-    ruz_reports.run_sync(refresh_all=False,template_id_only=699)     # OBSAH UCTOVNYCH ZAVIEROK
+    #rpo_bulk.run_full_sync(apply_daily=True)    # REGISTER PRAVNICKYCH OSOB
+    #ruz_units.run_sync()                        # UCTOVNE JEDNOTKY
+    #ruz_statements.run_sync(refresh_all=False)  # UCTOVNE ZAVIERKY PRE JEDNOTLIVE UCTOVNE JEDNOTKY
+    ruz_reports.run_sync(refresh_all=False,template_id_only=699,candidate_limit=50000)     # OBSAH UCTOVNYCH ZAVIEROK
 
     log.info("Running ruz_templates...")
     ruz_templates.run_sync()                    # SABLONY PRE OBSAH UCTOVNYCH ZAVIEROK
 
     log.info("Running ruz_report_items (legal_forms=112,121)...")
-    ruz_report_items.run_sync(legal_forms=("112", "121"))  # NAPAROVANIE SABLON S OBSAHOM UCTOVNYCH ZAVIEROK
+    ruz_report_items.run_sync(legal_forms=("112", "121",), hard_limit=50000)  # NAPAROVANIE SABLON S OBSAHOM UCTOVNYCH ZAVIEROK
 
     # SD enrichment (incremental)
     # log.info("Running sd_org (Slovensko.Digital enrichment)...")
@@ -219,3 +220,15 @@ def backfill_report_items_year(*, year: int = 2020) -> None:
     )
 
     log.info("BACKFILL %s finished.", year)
+
+def ml_run() -> None:
+    """
+    ML PD pipeline:
+      - trains models on core.ml_train_set/valid/test
+      - registers best model into core.ml_model_registry
+      - scores core.ml_score_set into core.ml_pd_predictions
+    """
+    ensure_db()
+    log.info("Starting ML_RUN (PD 12m)...")
+    ml_pd_run()
+    log.info("ML_RUN finished.")
