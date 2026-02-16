@@ -102,7 +102,7 @@ def daily() -> None:
     ruz_templates.run_sync()                    # SABLONY PRE OBSAH UCTOVNYCH ZAVIEROK
 
     log.info("Running ruz_report_items (legal_forms=112,121)...")
-    ruz_report_items.run_sync(legal_forms=("112", "121",), hard_limit=50000)  # NAPAROVANIE SABLON S OBSAHOM UCTOVNYCH ZAVIEROK
+    ruz_report_items.run_sync(legal_forms=("112", "121",), hard_limit=100000,use_state_cursor=False)  # NAPAROVANIE SABLON S OBSAHOM UCTOVNYCH ZAVIEROK
 
     # SD enrichment (incremental)
     # log.info("Running sd_org (Slovensko.Digital enrichment)...")
