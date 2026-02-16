@@ -180,7 +180,6 @@ def prep_upsert(detail: Dict[str, Any]) -> Dict[str, Any]:
         "titulnaStrana": Json(obsah.get("titulnaStrana")),
         "tabulky": Json(obsah.get("tabulky")),
         "prilohy": Json(detail.get("prilohy")),
-        "raw": Json(detail),
         "ico": extract_ico(detail),
     }
 
@@ -206,7 +205,11 @@ def run_sync(
     *,
     batch_size: int = 1000,
     refresh_all: bool = False,
-    hard_limit: Optional[int] = None,
+    hard_limit: Optional[int] = None,          # limit na uložené reporty (Stored)
+    candidate_limit: Optional[int] = None,     # limit na spracované kandidáty (rid loop)
+    http_limit: Optional[int] = None,          # limit na http_ok v tomto rune
+    max_seconds: Optional[int] = None,         # runtime budget
+    max_batches: Optional[int] = None,         # limit na počet batchov
     template_id_only: Optional[int] = None,
     use_template_cache: bool = True,
     reset_cursor: bool = False,
@@ -214,6 +217,11 @@ def run_sync(
     t0 = time.time()
     total, skipped_tombstone, skipped_empty, skipped_template = 0, 0, 0, 0
     http_ok, http_fail = 0, 0
+    candidates_seen = 0
+    batches_done = 0
+
+    def time_budget_exceeded() -> bool:
+        return max_seconds is not None and (time.time() - t0) >= max_seconds
 
     with get_conn(row_factory=dict_row) as conn:
         ensure_schema(conn)
@@ -223,9 +231,29 @@ def run_sync(
             conn.commit()
 
         last_id = int((conn.execute(SQL_GET_STATE).fetchone() or {"last_report_id": 0})["last_report_id"])
-        log.info("Start cursor last_id=%d | refresh_all=%s | template_id_only=%s", last_id, refresh_all, template_id_only)
+        log.info(
+            "Start cursor last_id=%d | refresh_all=%s | template_id_only=%s | batch_size=%d | hard_limit=%s | candidate_limit=%s | http_limit=%s | max_seconds=%s | max_batches=%s",
+            last_id, refresh_all, template_id_only, batch_size,
+            str(hard_limit), str(candidate_limit), str(http_limit), str(max_seconds), str(max_batches),
+        )
 
         while True:
+            if time_budget_exceeded():
+                log.info("Stop: max_seconds reached (%s)", max_seconds)
+                break
+            if max_batches is not None and batches_done >= max_batches:
+                log.info("Stop: max_batches reached (%s)", max_batches)
+                break
+            if candidate_limit is not None and candidates_seen >= candidate_limit:
+                log.info("Stop: candidate_limit reached (%s)", candidate_limit)
+                break
+            if http_limit is not None and http_ok >= http_limit:
+                log.info("Stop: http_limit reached (%s)", http_limit)
+                break
+            if hard_limit is not None and total >= hard_limit:
+                log.info("Stop: hard_limit reached (%s)", hard_limit)
+                break
+
             rows = conn.execute(
                 SQL_FETCH_BATCH_ALL_CURSOR if refresh_all else SQL_FETCH_BATCH_MISSING_CURSOR,
                 (last_id, batch_size),
@@ -236,9 +264,22 @@ def run_sync(
             ids = [int(r["report_id"]) for r in rows]
             batch_max = ids[-1]
 
+            # Spracuj batch (DB writes v transakcii)
             with conn.transaction():
                 for rid in ids:
-                    # 1) cache skip (ak je zapnuté)
+                    candidates_seen += 1
+
+                    # rýchle stop checky aj uprostred batchu
+                    if candidate_limit is not None and candidates_seen > candidate_limit:
+                        break
+                    if http_limit is not None and http_ok >= http_limit:
+                        break
+                    if hard_limit is not None and total >= hard_limit:
+                        break
+                    if time_budget_exceeded():
+                        break
+
+                    # 1) cache skip
                     if use_template_cache:
                         m = conn.execute(SQL_GET_TEMPLATE_MAP, (rid,)).fetchone()
                         if m:
@@ -249,9 +290,11 @@ def run_sync(
                                 skipped_template += 1
                                 continue
 
-                    # 2) HTTP fetch
+                    # 2) HTTP fetch (zatvori response deterministicky)
                     try:
-                        d = fetch_detail(rid)
+                        with SESSION.get(_url(DETAIL_PATH), params={"id": rid}, timeout=REQUEST_TIMEOUT) as r:
+                            r.raise_for_status()
+                            d = r.json()
                         http_ok += 1
                     except Exception as e:
                         http_fail += 1
@@ -261,7 +304,7 @@ def run_sync(
                     is_tomb = _is_tombstone(d)
                     sabl = d.get("idSablony")
 
-                    # 3) upsert mapu hneď po fetchnutí (aby sa nabudúce skipovalo bez HTTP)
+                    # 3) upsert template map
                     if use_template_cache:
                         conn.execute(SQL_UPSERT_TEMPLATE_MAP, (rid, sabl, is_tomb))
 
@@ -273,9 +316,10 @@ def run_sync(
                         skipped_template += 1
                         continue
 
-                    # 4) DB write (len pre “správne” reporty)
+                    # 4) DB write
                     try:
                         params = prep_upsert(d)
+
                         with conn.cursor() as curu:
                             curu.execute(SQL_UPSERT_REPORT, params)
 
@@ -293,29 +337,37 @@ def run_sync(
                     except Exception as e:
                         log.error("DB write failed (report_id=%s): %s", rid, e)
 
-                    if hard_limit is not None and total >= hard_limit:
-                        break
-
-                # posuň cursor aj keď sa nič neuložilo (ináč sa zasekneš na wrong_template)
+                # cursor posuň vždy na batch_max (aj keď sa batch prerušil kvôli limitu)
                 conn.execute(SQL_SET_STATE, (batch_max,))
                 last_id = batch_max
+
+            # commit mimo transakcie batchu (state je v transakcii vyššie, ale commit robí context)
+            conn.commit()
+
+            batches_done += 1
 
             elapsed = time.time() - t0
             store_rate = total / elapsed if elapsed > 0 else 0.0
             http_rate = http_ok / elapsed if elapsed > 0 else 0.0
+            seen_rate = candidates_seen / elapsed if elapsed > 0 else 0.0
 
             log.info(
-                "Stored=%d | cursor=%d | batch=%d | store_speed=%.2f/s | http_ok=%d http_fail=%d http_speed=%.2f/s | tomb=%d | empty=%d | wrong_template=%d",
-                total, last_id, len(ids), store_rate, http_ok, http_fail, http_rate,
+                "Stored=%d | cursor=%d | batches=%d | batch=%d | store_speed=%.2f/s | candidates_seen=%d seen_speed=%.2f/s | http_ok=%d http_fail=%d http_speed=%.2f/s | tomb=%d | empty=%d | wrong_template=%d",
+                total, last_id, batches_done, len(ids),
+                store_rate, candidates_seen, seen_rate,
+                http_ok, http_fail, http_rate,
                 skipped_tombstone, skipped_empty, skipped_template
             )
 
-            if hard_limit is not None and total >= hard_limit:
-                break
+        # finálny commit stavu (ak by sa loop skončil pred commitom)
+        conn.commit()
 
         log.info(
-            "Done. Stored=%d | http_ok=%d http_fail=%d | tomb=%d | empty=%d | wrong_template=%d | time=%.1fs | last_id=%d",
-            total, http_ok, http_fail, skipped_tombstone, skipped_empty, skipped_template, time.time() - t0, last_id
+            "Done. Stored=%d | candidates_seen=%d | http_ok=%d http_fail=%d | tomb=%d | empty=%d | wrong_template=%d | batches=%d | time=%.1fs | last_id=%d",
+            total, candidates_seen, http_ok, http_fail,
+            skipped_tombstone, skipped_empty, skipped_template,
+            batches_done, time.time() - t0, last_id
         )
+
 
 

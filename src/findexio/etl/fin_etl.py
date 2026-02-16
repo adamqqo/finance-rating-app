@@ -261,10 +261,7 @@ SELECT
     END AS x09_equity_leverage,
 
     -- X10 = total_liabilities / receivables
-    CASE
-      WHEN a.receivables IS NULL OR a.receivables = 0 THEN NULL
-      ELSE COALESCE(a.total_liabilities,0) / a.receivables
-    END AS x10_insolvency,
+    COALESCE(a.total_liabilities / NULLIF(a.receivables,0), 0) AS x10_insolvency,
 
     -- ===== Slovak discriminant model (Gajdosikova et al., 2025): y_SK =====
     (
@@ -275,7 +272,7 @@ SELECT
       - 0.594 * (CASE WHEN (COALESCE(a.profit_before_tax,0) + COALESCE(a.interest_expense,0)) = 0 THEN NULL ELSE COALESCE(a.interest_expense,0) / (COALESCE(a.profit_before_tax,0) + COALESCE(a.interest_expense,0)) END) -- X7
       - 0.022 * (CASE WHEN (COALESCE(a.net_income,0) + COALESCE(a.depreciation,0) + COALESCE(a.interest_expense,0)) = 0 THEN NULL ELSE COALESCE(a.total_liabilities,0) / (COALESCE(a.net_income,0) + COALESCE(a.depreciation,0) + COALESCE(a.interest_expense,0)) END) -- X8
       - 0.116 * (CASE WHEN a.equity IS NULL OR a.equity = 0 THEN NULL ELSE COALESCE(a.total_assets,0) / a.equity END) -- X9
-      + 1.787 * (CASE WHEN a.receivables IS NULL OR a.receivables = 0 THEN NULL ELSE COALESCE(a.total_liabilities,0) / a.receivables END) -- X10
+      + 1.787 * COALESCE(a.total_liabilities / NULLIF(a.receivables,0), 0) -- X10
     ) AS model_sk_raw,
 
     (a.equity IS NOT NULL AND a.equity < 0) AS negative_equity_flag,

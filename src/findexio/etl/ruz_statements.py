@@ -121,7 +121,7 @@ def prepare_upsert_params(detail: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": detail.get("id"),
         # RÚZ API používa `idUJ` (nie idUctovnejJednotky)
-        "id_uctovnej_jednotky": detail.get("idUctovnejJednotky") or detail.get("idUJ"),
+        "id_uctovnej_jednotky": detail.get("idUJ") or detail.get("idUctovnejJednotky"),
 
         "obdobie_od": normalize_date(detail.get("obdobieOd")),
         "obdobie_do": normalize_date(detail.get("obdobieDo")),

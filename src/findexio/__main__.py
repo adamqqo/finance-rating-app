@@ -28,6 +28,7 @@ def main() -> None:
     sub.add_parser("update02", help="Update report items and templates")
     sub.add_parser("fin_ddl_run", help="DDL Pipeline")
     sub.add_parser("fin_etl_run", help="ETL Pipeline")
+    sub.add_parser("ml_run", help="ML PD pipeline (train+register+score)")
 
     # NEW: Slovensko.Digital enrichment
     p_sd = sub.add_parser("sd-org", help="Run Slovensko.Digital org enrichment (sync + batch upserts)")
@@ -147,6 +148,10 @@ def main() -> None:
 
     if args.cmd == "ruz-reports":
         ruz_reports.run_sync(batch_size=args.batch_size, refresh_all=args.refresh_all, hard_limit=args.hard_limit)
+        return
+
+    if args.cmd == "ml_run":
+        runner.ml_run()
         return
 
 
