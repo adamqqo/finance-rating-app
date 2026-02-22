@@ -96,20 +96,20 @@ def daily() -> None:
     #rpo_bulk.run_full_sync(apply_daily=True)    # REGISTER PRAVNICKYCH OSOB
     #ruz_units.run_sync()                        # UCTOVNE JEDNOTKY
     #ruz_statements.run_sync(refresh_all=False)  # UCTOVNE ZAVIERKY PRE JEDNOTLIVE UCTOVNE JEDNOTKY
-    ruz_reports.run_sync(refresh_all=False,template_id_only=699,candidate_limit=50000)     # OBSAH UCTOVNYCH ZAVIEROK
+    ruz_reports.run_sync(refresh_all=False,template_id_only=699,candidate_limit=20000)     # OBSAH UCTOVNYCH ZAVIEROK
 
-    log.info("Running ruz_templates...")
-    ruz_templates.run_sync()                    # SABLONY PRE OBSAH UCTOVNYCH ZAVIEROK
+    #log.info("Running ruz_templates...")
+    #ruz_templates.run_sync()                    # SABLONY PRE OBSAH UCTOVNYCH ZAVIEROK
 
-    log.info("Running ruz_report_items (legal_forms=112,121)...")
-    ruz_report_items.run_sync(legal_forms=("112", "121",), hard_limit=100000,use_state_cursor=False)  # NAPAROVANIE SABLON S OBSAHOM UCTOVNYCH ZAVIEROK
+    #log.info("Running ruz_report_items (legal_forms=112,121)...")
+    #ruz_report_items.run_sync(legal_forms=("112", "121",), hard_limit=100000,use_state_cursor=False)  # NAPAROVANIE SABLON S OBSAHOM UCTOVNYCH ZAVIEROK
 
     # SD enrichment (incremental)
     # log.info("Running sd_org (Slovensko.Digital enrichment)...")
     # sd_org_sync()
 
-    log.info("Running FIN_ETL...")
-    fin_etl.run()
+    #log.info("Running FIN_ETL...")
+    #fin_etl.run()
 
     log.info("DAILY finished.")
 
