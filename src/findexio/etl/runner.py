@@ -174,7 +174,7 @@ def sd_org_run(*, hard_limit: int | None = None, db_batch_size: int = 200) -> No
     log.info("SD_ORG sync finished.")
 
 
-def backfill_report_items_year(*, year: int = 2020) -> None:
+def backfill_report_items_year(*, year: int = 2024) -> None:
     """
     One-off backfill of ruz_report_items for a specific year.
     - Does NOT move ruz_report_items_state.last_report_id

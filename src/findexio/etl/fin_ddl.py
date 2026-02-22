@@ -223,11 +223,32 @@ CREATE TABLE IF NOT EXISTS core.fin_annual_features
     x10_insolvency numeric,
     model_sk_raw numeric,
     model_sk_pct numeric,
+    -- =========================================================
+    -- Kralicek Quick Test (4 metrics) + intermediates
+    -- =========================================================
+    -- Intermediates
+    cash_begin numeric,
+    ebitda numeric,
+    cf_kralicek numeric,
+    -- Quick Test metrics
+    -- 1) Equity/Assets is already equity_ratio
+    -- 2) Period of debt payment (years) = (Liabilities - Cash) / CF
+    period_debt_payment_years numeric,
+    -- 3) Profitability of assets = EBIT / Assets
+    ebit_to_assets numeric,
+    -- 4) Cash Flow / Revenues = CF / Revenues
+    cf_to_revenue numeric,
 
     CONSTRAINT fin_annual_features_pkey PRIMARY KEY (report_id, norm_period)
-)
+);
 
-TABLESPACE pg_default;
+ALTER TABLE IF EXISTS core.fin_annual_features
+  ADD COLUMN IF NOT EXISTS cash_begin numeric,
+  ADD COLUMN IF NOT EXISTS ebitda numeric,
+  ADD COLUMN IF NOT EXISTS cf_kralicek numeric,
+  ADD COLUMN IF NOT EXISTS period_debt_payment_years numeric,
+  ADD COLUMN IF NOT EXISTS ebit_to_assets numeric,
+  ADD COLUMN IF NOT EXISTS cf_to_revenue numeric;
 
 ALTER TABLE IF EXISTS core.fin_annual_features
     OWNER to postgres;
