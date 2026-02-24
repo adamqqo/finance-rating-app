@@ -3,14 +3,14 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterable, Optional
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from ..config import RUZ_API_BASE
-from ..db import get_conn, ensure_schema
-from ..http import build_session, DEFAULT_TIMEOUT
+from ..db import ensure_schema, get_conn
+from ..http import DEFAULT_TIMEOUT, build_session
 
 SESSION = build_session(user_agent="Findexio/0.1 (ruz-reports)")
 API_BASE = RUZ_API_BASE.rstrip("/")
@@ -57,36 +57,13 @@ ON CONFLICT (report_id) DO UPDATE SET
   fetched_at = now();
 """
 
-SQL_COUNT_MISSING = """
-SELECT COUNT(*) AS c
-FROM core.ruz_statements s
-CROSS JOIN LATERAL jsonb_array_elements_text(s.id_uctovnych_vykazov) AS t(x)
-LEFT JOIN core.ruz_reports r ON r.id = t.x::bigint
-WHERE r.id IS NULL;
-"""
-
-SQL_FETCH_BATCH_MISSING = """
-SELECT t.x::bigint AS report_id
-FROM core.ruz_statements s
-CROSS JOIN LATERAL jsonb_array_elements_text(s.id_uctovnych_vykazov) AS t(x)
-LEFT JOIN core.ruz_reports r ON r.id = t.x::bigint
-WHERE r.id IS NULL
-ORDER BY t.x::bigint
-LIMIT %s OFFSET %s;
-"""
-
-SQL_COUNT_ALL = """
-SELECT COUNT(*) AS c
-FROM core.ruz_statements s
-CROSS JOIN LATERAL jsonb_array_elements_text(s.id_uctovnych_vykazov) AS t(x);
-"""
-
-SQL_FETCH_BATCH_ALL = """
-SELECT t.x::bigint AS report_id
-FROM core.ruz_statements s
-CROSS JOIN LATERAL jsonb_array_elements_text(s.id_uctovnych_vykazov) AS t(x)
-ORDER BY t.x::bigint
-LIMIT %s OFFSET %s;
+# statement_id -> unit.ico (canonical)
+SQL_GET_UNIT_ICO_FOR_STATEMENT = """
+SELECT u.ico
+FROM core.ruz_unit_zavierky uz
+JOIN core.ruz_units u ON u.id = uz.unit_id
+WHERE uz.zavierka_id = %s
+LIMIT 1;
 """
 
 SQL_UPSERT_REPORT = """
@@ -116,13 +93,6 @@ ON CONFLICT (id) DO UPDATE SET
     updated_at = now();
 """
 
-SQL_DELETE_ROWS_FOR_REPORT = "DELETE FROM core.ruz_report_rows WHERE report_id = %s;"
-
-SQL_INSERT_ROW = """
-INSERT INTO core.ruz_report_rows (report_id, table_name, row_idx, row_key, row_name, cells, updated_at)
-VALUES (%s, %s, %s, %s, %s, %s, now());
-"""
-
 _re_y = re.compile(r"^\d{4}$")
 _re_ym = re.compile(r"^\d{4}-\d{2}$")
 _re_ymd = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -149,12 +119,6 @@ def _is_tombstone(detail: Dict[str, Any]) -> bool:
     return str(detail.get("stav", "")).strip().lower().startswith("zmazan")
 
 
-def fetch_detail(report_id: int) -> Dict[str, Any]:
-    r = SESSION.get(_url(DETAIL_PATH), params={"id": report_id}, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
-
-
 def extract_ico(detail: Dict[str, Any]) -> Optional[str]:
     t = (detail.get("obsah") or {}).get("titulnaStrana") or {}
     ico = t.get("ico")
@@ -162,6 +126,15 @@ def extract_ico(detail: Dict[str, Any]) -> Optional[str]:
         return None
     s = str(ico).strip().replace(" ", "")
     return s if (s.isdigit() and len(s) == 8) else None
+
+
+def norm_ico8(x: Optional[str]) -> Optional[str]:
+    if not x:
+        return None
+    s = re.sub(r"\D", "", str(x))
+    if not s:
+        return None
+    return s.zfill(8)[:8]
 
 
 def prep_upsert(detail: Dict[str, Any]) -> Dict[str, Any]:
@@ -184,23 +157,6 @@ def prep_upsert(detail: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def iter_rows_from_obsah(detail: Dict[str, Any]) -> Iterator[tuple]:
-    obsah = detail.get("obsah") or {}
-    tables = obsah.get("tabulky") or []
-    if not isinstance(tables, list):
-        return
-    for t in tables:
-        table_name = t.get("nazov") or t.get("name") or t.get("kod") or None
-        rows = t.get("riadky") or t.get("rows") or []
-        if not isinstance(rows, list):
-            continue
-        for idx, r in enumerate(rows):
-            row_key = r.get("kod") or r.get("kluc") or r.get("key") or None
-            row_name = r.get("nazov") or r.get("name") or r.get("text") or None
-            cells = r.get("bunky") or r.get("cells") or r.get("data") or r
-            yield (table_name, idx, row_key, row_name, cells)
-
-
 def run_sync(
     *,
     batch_size: int = 1000,
@@ -210,15 +166,24 @@ def run_sync(
     http_limit: Optional[int] = None,          # limit na http_ok v tomto rune
     max_seconds: Optional[int] = None,         # runtime budget
     max_batches: Optional[int] = None,         # limit na počet batchov
-    template_id_only: Optional[int] = None,
+    template_id_only: Optional[int | Iterable[int]] = None,
     use_template_cache: bool = True,
     reset_cursor: bool = False,
 ) -> None:
     t0 = time.time()
-    total, skipped_tombstone, skipped_empty, skipped_template = 0, 0, 0, 0
+    total, skipped_tombstone, skipped_template = 0, 0, 0
+    skipped_ico_mismatch = 0
     http_ok, http_fail = 0, 0
     candidates_seen = 0
     batches_done = 0
+
+    # normalize template_id_only -> set[int] or None
+    if template_id_only is None:
+        template_filter: Optional[set[int]] = None
+    elif isinstance(template_id_only, int):
+        template_filter = {template_id_only}
+    else:
+        template_filter = {int(x) for x in template_id_only}
 
     def time_budget_exceeded() -> bool:
         return max_seconds is not None and (time.time() - t0) >= max_seconds
@@ -233,7 +198,7 @@ def run_sync(
         last_id = int((conn.execute(SQL_GET_STATE).fetchone() or {"last_report_id": 0})["last_report_id"])
         log.info(
             "Start cursor last_id=%d | refresh_all=%s | template_id_only=%s | batch_size=%d | hard_limit=%s | candidate_limit=%s | http_limit=%s | max_seconds=%s | max_batches=%s",
-            last_id, refresh_all, template_id_only, batch_size,
+            last_id, refresh_all, template_filter, batch_size,
             str(hard_limit), str(candidate_limit), str(http_limit), str(max_seconds), str(max_batches),
         )
 
@@ -264,12 +229,10 @@ def run_sync(
             ids = [int(r["report_id"]) for r in rows]
             batch_max = ids[-1]
 
-            # Spracuj batch (DB writes v transakcii)
             with conn.transaction():
                 for rid in ids:
                     candidates_seen += 1
 
-                    # rýchle stop checky aj uprostred batchu
                     if candidate_limit is not None and candidates_seen > candidate_limit:
                         break
                     if http_limit is not None and http_ok >= http_limit:
@@ -286,11 +249,11 @@ def run_sync(
                             if m["tombstone"]:
                                 skipped_tombstone += 1
                                 continue
-                            if template_id_only is not None and m["id_sablony"] != template_id_only:
+                            if template_filter is not None and m["id_sablony"] not in template_filter:
                                 skipped_template += 1
                                 continue
 
-                    # 2) HTTP fetch (zatvori response deterministicky)
+                    # 2) HTTP fetch
                     try:
                         with SESSION.get(_url(DETAIL_PATH), params={"id": rid}, timeout=REQUEST_TIMEOUT) as r:
                             r.raise_for_status()
@@ -312,38 +275,48 @@ def run_sync(
                         skipped_tombstone += 1
                         continue
 
-                    if template_id_only is not None and sabl != template_id_only:
+                    if template_filter is not None and sabl not in template_filter:
                         skipped_template += 1
                         continue
 
-                    # 4) DB write
+                    # 3.5) ICO mismatch check: unit.ico vs titulnaStrana.ico -> IGNORE (do not store)
+                    try:
+                        statement_id = d.get("idUctovnejZavierky")
+                        ico_doc = extract_ico(d)
+
+                        ico_unit = None
+                        if statement_id:
+                            urow = conn.execute(SQL_GET_UNIT_ICO_FOR_STATEMENT, (statement_id,)).fetchone()
+                            if urow:
+                                ico_unit = urow["ico"]
+
+                        ico_doc_n = norm_ico8(ico_doc)
+                        ico_unit_n = norm_ico8(ico_unit)
+
+                        if ico_doc_n and ico_unit_n and ico_doc_n != ico_unit_n:
+                            skipped_ico_mismatch += 1
+                            log.warning(
+                                "Skip report due to ICO mismatch | report_id=%s statement_id=%s ico_unit=%s ico_doc=%s template_id=%s",
+                                rid, statement_id, ico_unit_n, ico_doc_n, sabl
+                            )
+                            continue
+                    except Exception as e:
+                        # fail-open: if check fails, keep storing (avoid accidental data loss)
+                        log.warning("ICO mismatch check failed (report_id=%s): %s", rid, e)
+
+                    # 4) DB write (only ruz_reports)
                     try:
                         params = prep_upsert(d)
-
-                        with conn.cursor() as curu:
-                            curu.execute(SQL_UPSERT_REPORT, params)
-
-                        tables = (d.get("obsah") or {}).get("tabulky")
-                        if not isinstance(tables, list):
-                            skipped_empty += 1
-                            continue
-
-                        with conn.cursor() as curd:
-                            curd.execute(SQL_DELETE_ROWS_FOR_REPORT, (rid,))
-                            for table_name, row_idx, row_key, row_name, cells in iter_rows_from_obsah(d):
-                                curd.execute(SQL_INSERT_ROW, (rid, table_name, row_idx, row_key, row_name, Json(cells)))
-
+                        with conn.cursor() as cur:
+                            cur.execute(SQL_UPSERT_REPORT, params)
                         total += 1
                     except Exception as e:
                         log.error("DB write failed (report_id=%s): %s", rid, e)
 
-                # cursor posuň vždy na batch_max (aj keď sa batch prerušil kvôli limitu)
                 conn.execute(SQL_SET_STATE, (batch_max,))
                 last_id = batch_max
 
-            # commit mimo transakcie batchu (state je v transakcii vyššie, ale commit robí context)
             conn.commit()
-
             batches_done += 1
 
             elapsed = time.time() - t0
@@ -352,22 +325,19 @@ def run_sync(
             seen_rate = candidates_seen / elapsed if elapsed > 0 else 0.0
 
             log.info(
-                "Stored=%d | cursor=%d | batches=%d | batch=%d | store_speed=%.2f/s | candidates_seen=%d seen_speed=%.2f/s | http_ok=%d http_fail=%d http_speed=%.2f/s | tomb=%d | empty=%d | wrong_template=%d",
+                "Stored=%d | cursor=%d | batches=%d | batch=%d | store_speed=%.2f/s | candidates_seen=%d seen_speed=%.2f/s | http_ok=%d http_fail=%d http_speed=%.2f/s | tomb=%d | wrong_template=%d | ico_mismatch=%d",
                 total, last_id, batches_done, len(ids),
                 store_rate, candidates_seen, seen_rate,
                 http_ok, http_fail, http_rate,
-                skipped_tombstone, skipped_empty, skipped_template
+                skipped_tombstone, skipped_template,
+                skipped_ico_mismatch,
             )
 
-        # finálny commit stavu (ak by sa loop skončil pred commitom)
         conn.commit()
-
         log.info(
-            "Done. Stored=%d | candidates_seen=%d | http_ok=%d http_fail=%d | tomb=%d | empty=%d | wrong_template=%d | batches=%d | time=%.1fs | last_id=%d",
+            "Done. Stored=%d | candidates_seen=%d | http_ok=%d http_fail=%d | tomb=%d | wrong_template=%d | ico_mismatch=%d | batches=%d | time=%.1fs | last_id=%d",
             total, candidates_seen, http_ok, http_fail,
-            skipped_tombstone, skipped_empty, skipped_template,
+            skipped_tombstone, skipped_template,
+            skipped_ico_mismatch,
             batches_done, time.time() - t0, last_id
         )
-
-
-

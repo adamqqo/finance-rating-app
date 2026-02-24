@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 from psycopg.rows import dict_row
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
@@ -138,7 +139,7 @@ def _insert_model(
     trained_to: int,
     feature_list: List[str],
     metrics: Dict[str, Any],
-    pipe: Pipeline,
+    pipe: Any,  # Pipeline or CalibratedClassifierCV
 ) -> int:
     blob = pickle.dumps(pipe)
     sql = """
@@ -193,6 +194,25 @@ def _upsert_predictions(df_meta: pd.DataFrame, pd_hat: np.ndarray, model_id: int
         conn.commit()
 
 
+def _calibrate_prefit(
+    fitted_estimator: Any,
+    X_valid: pd.DataFrame,
+    y_valid: np.ndarray,
+    *,
+    method: str,
+) -> CalibratedClassifierCV:
+    """
+    Calibrate an already-fitted estimator using the validation set only.
+    """
+    calibrator = CalibratedClassifierCV(
+        estimator=fitted_estimator,
+        method=method,
+        cv="prefit",
+    )
+    calibrator.fit(X_valid, y_valid)
+    return calibrator
+
+
 def run() -> None:
     # Load splits (already filtered by your SQL views)
     df_tr = _fetch_labeled("core.ml_train_set")
@@ -208,7 +228,7 @@ def run() -> None:
     pos_weight = n_neg / max(1, n_pos)
     log.info("Train n=%d pos=%d neg=%d pos_weight=%.2f", len(ytr), n_pos, n_neg, pos_weight)
 
-    # Train models
+    # ---- Train base models (raw) ----
     lr = _build_logreg()
     lr.fit(Xtr, ytr)
 
@@ -216,47 +236,73 @@ def run() -> None:
     sample_weight = np.where(ytr == 1, pos_weight, 1.0)
     hgb.fit(Xtr, ytr, clf__sample_weight=sample_weight)
 
-    # Evaluate
-    lr_metrics = {
+    # ---- Evaluate raw ----
+    lr_raw = {
         "train": _metrics(ytr, lr.predict_proba(Xtr)[:, 1]),
         "valid": _metrics(yva, lr.predict_proba(Xva)[:, 1]),
         "test": _metrics(yte, lr.predict_proba(Xte)[:, 1]),
     }
-    hgb_metrics = {
+    hgb_raw = {
         "train": _metrics(ytr, hgb.predict_proba(Xtr)[:, 1]),
         "valid": _metrics(yva, hgb.predict_proba(Xva)[:, 1]),
         "test": _metrics(yte, hgb.predict_proba(Xte)[:, 1]),
     }
 
-    log.info("LogReg metrics: %s", json.dumps(lr_metrics, ensure_ascii=False))
-    log.info("HGB metrics: %s", json.dumps(hgb_metrics, ensure_ascii=False))
+    log.info("LogReg RAW metrics: %s", json.dumps(lr_raw, ensure_ascii=False))
+    log.info("HGB   RAW metrics: %s", json.dumps(hgb_raw, ensure_ascii=False))
 
-    # Pick best by VALID PR AUC
-    pr_lr = lr_metrics["valid"]["pr_auc"] or -1.0
-    pr_hgb = hgb_metrics["valid"]["pr_auc"] or -1.0
+    # ---- Pick best by VALID PR AUC (raw) ----
+    pr_lr = lr_raw["valid"]["pr_auc"] or -1.0
+    pr_hgb = hgb_raw["valid"]["pr_auc"] or -1.0
+
     best_algo = "hgb" if pr_hgb >= pr_lr else "logreg"
-    best_pipe = hgb if best_algo == "hgb" else lr
-    best_metrics = hgb_metrics if best_algo == "hgb" else lr_metrics
+    best_base = hgb if best_algo == "hgb" else lr
+    best_raw_metrics = hgb_raw if best_algo == "hgb" else lr_raw
+
+    # ---- Calibrate on VALID only ----
+    # Trees -> isotonic, LogReg -> sigmoid (more stable)
+    cal_method = "isotonic" if best_algo == "hgb" else "sigmoid"
+    calibrated = _calibrate_prefit(best_base, Xva, yva, method=cal_method)
+
+    # ---- Evaluate calibrated (important for interpretability) ----
+    best_cal_metrics = {
+        "train": _metrics(ytr, calibrated.predict_proba(Xtr)[:, 1]),
+        "valid": _metrics(yva, calibrated.predict_proba(Xva)[:, 1]),
+        "test": _metrics(yte, calibrated.predict_proba(Xte)[:, 1]),
+    }
+
+    log.info("BEST algo=%s CAL(%s) metrics: %s", best_algo, cal_method, json.dumps(best_cal_metrics, ensure_ascii=False))
 
     trained_from = int(df_tr["fiscal_year"].min())
     trained_to = int(df_tr["fiscal_year"].max())
 
+    # Store both raw + calibrated metrics for transparency
+    metrics_payload = {
+        "selection_rule": "best_by_valid_pr_auc_raw",
+        "best_algo": best_algo,
+        "calibration": {"method": cal_method, "fit_on": "valid_set_only"},
+        "raw": best_raw_metrics,
+        "calibrated": best_cal_metrics,
+    }
+
+    # Persist CALIBRATED model (so scoring uses calibrated probs)
     model_id = _insert_model(
         name="pd_default",
         horizon="12m",
-        algo=best_algo,
+        algo=f"{best_algo}+cal({cal_method})",
         trained_from=trained_from,
         trained_to=trained_to,
         feature_list=FEATURES_NUM + FEATURES_BOOL,
-        metrics=best_metrics,
-        pipe=best_pipe,
+        metrics=metrics_payload,
+        pipe=calibrated,
     )
-    log.info("Registered best model: algo=%s id=%d", best_algo, model_id)
+    log.info("Registered calibrated model: algo=%s+cal(%s) id=%d", best_algo, cal_method, model_id)
 
-    # Score latest population
+    # ---- Score latest population using calibrated PD ----
     df_sc = _fetch_score("core.ml_score_set")
     Xsc = _prepare_X(df_sc)
-    pd_hat = best_pipe.predict_proba(Xsc)[:, 1]
+
+    pd_hat = calibrated.predict_proba(Xsc)[:, 1]
 
     meta = df_sc[["report_id", "ico", "fiscal_year", "period_end"]].copy()
     _upsert_predictions(meta, pd_hat, model_id)
