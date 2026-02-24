@@ -232,7 +232,7 @@ CREATE TABLE IF NOT EXISTS core.sd_org (
 );
 
 ALTER TABLE core.sd_org
-ADD COLUMN nace_division TEXT;
+ADD COLUMN IF NOT EXISTS nace_division TEXT;
 
 UPDATE core.sd_org
 SET nace_division = LEFT(main_activity_code_id::text, 2);
