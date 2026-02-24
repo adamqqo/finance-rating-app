@@ -107,6 +107,9 @@ CREATE TABLE IF NOT EXISTS core.ruz_reports (
     prilohy                 JSONB,
     updated_at              TIMESTAMPTZ DEFAULT now()
 );
+ALTER TABLE core.ruz_reports
+ADD COLUMN IF NOT EXISTS dq_ico_conflict BOOLEAN NOT NULL DEFAULT FALSE;
+
 CREATE INDEX IF NOT EXISTS ix_ruz_reports_ico  ON core.ruz_reports(ico);
 CREATE INDEX IF NOT EXISTS ix_ruz_reports_year ON core.ruz_reports(((titulna->>'obdobieDo')));
 
@@ -227,6 +230,12 @@ CREATE TABLE IF NOT EXISTS core.sd_org (
     main_activity_code_name TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE core.sd_org
+ADD COLUMN nace_division TEXT;
+
+UPDATE core.sd_org
+SET nace_division = LEFT(main_activity_code_id::text, 2);
 
 -- =========================
 -- SD – Addresses
