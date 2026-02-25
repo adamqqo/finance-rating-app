@@ -207,6 +207,16 @@ INSERT INTO core.ruz_report_items_state (id, last_report_id)
 VALUES (1, 0)
 ON CONFLICT (id) DO NOTHING;
 
+CREATE TABLE IF NOT EXISTS core.ruz_report_items_done (
+  report_id  bigint PRIMARY KEY,
+  template_id bigint,
+  processed_at timestamptz DEFAULT now(),
+  items_written integer DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS ruz_report_items_done_tpl_idx
+  ON core.ruz_report_items_done (template_id);
+  
 -- =========================
 -- SD – Activity code dim
 -- =========================
