@@ -21,7 +21,7 @@ from ..ml.pd_model import run as ml_pd_run
 from .sd_org import run_sync as sd_org_sync
 
 # NEW: report items test module (writes into core.ruz_report_items_test)
-from . import ruz_report_items_test
+#from . import ruz_report_items_test
 
 
 def _setup_logging_if_needed() -> None:
@@ -224,9 +224,9 @@ def backfill_report_items_year(*, year: int = 2024) -> None:
 
     log.info("BACKFILL %s finished.", year)
 
-
+"""
 def test_items(*, per_template: int = 10, truncate_first: bool = True) -> None:
-    """
+    
     Production-safe test extractor:
       - Writes ONLY into core.ruz_report_items_test
       - Samples:
@@ -234,7 +234,7 @@ def test_items(*, per_template: int = 10, truncate_first: bool = True) -> None:
           per_template x 687
           per_template paired statements => ~2*per_template reports of 21 and 22
       - Does NOT touch ruz_report_items_state
-    """
+    
     #ensure_db()
     log.info("Starting TEST_ITEMS: per_template=%s truncate_first=%s", per_template, truncate_first)
     ruz_report_items_test.run_test_insert(
@@ -243,7 +243,7 @@ def test_items(*, per_template: int = 10, truncate_first: bool = True) -> None:
         truncate_first=truncate_first,
     )
     log.info("TEST_ITEMS finished.")
-
+"""
 
 def ml_run() -> None:
     """
