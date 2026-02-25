@@ -30,6 +30,11 @@ def main() -> None:
     sub.add_parser("fin_etl_run", help="ETL Pipeline")
     sub.add_parser("ml_run", help="ML PD pipeline (train+register+score)")
 
+    # NEW: test items (writes into core.ruz_report_items_test)
+    p_ti = sub.add_parser("test_items", help="Test report item extraction into core.ruz_report_items_test (699,687,21,22)")
+    p_ti.add_argument("--per-template", type=int, default=10, help="How many samples per template (699,687) and per pair (21/22)")
+    p_ti.add_argument("--no-truncate", action="store_true", help="Do not truncate core.ruz_report_items_test before insert")
+
     # NEW: Slovensko.Digital enrichment
     p_sd = sub.add_parser("sd-org", help="Run Slovensko.Digital org enrichment (sync + batch upserts)")
     p_sd.add_argument("--hard-limit", type=int, default=None, help="Max number of orgs to process in this run")
@@ -148,6 +153,10 @@ def main() -> None:
 
     if args.cmd == "ruz-reports":
         ruz_reports.run_sync(batch_size=args.batch_size, refresh_all=args.refresh_all, hard_limit=args.hard_limit)
+        return
+
+    if args.cmd == "test_items":
+        runner.test_items(per_template=args.per_template, truncate_first=not args.no_truncate)
         return
 
     if args.cmd == "ml_run":
