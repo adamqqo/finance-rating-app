@@ -17,6 +17,38 @@ LEGAL_FORMS_DEFAULT: Tuple[str, ...] = ("112", "121")
 SQL_GET_STATE = "SELECT last_report_id FROM core.ruz_report_items_state WHERE id = 1;"
 SQL_SET_STATE = "UPDATE core.ruz_report_items_state SET last_report_id = %s, updated_at = now() WHERE id = 1;"
 
+# -------------------------------------------------------------------
+# NEW: "done" marker table - prevents infinite reprocessing for reports
+#      that produce 0 numeric items (e.g., PDF-only or non-numeric data)
+# -------------------------------------------------------------------
+
+SQL_CREATE_DONE_TABLE = """
+CREATE TABLE IF NOT EXISTS core.ruz_report_items_done (
+  report_id     bigint PRIMARY KEY,
+  template_id   bigint,
+  processed_at  timestamptz DEFAULT now(),
+  items_written integer DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS ruz_report_items_done_tpl_idx
+  ON core.ruz_report_items_done (template_id);
+"""
+
+SQL_MARK_DONE = """
+INSERT INTO core.ruz_report_items_done (report_id, template_id, processed_at, items_written)
+VALUES (%s, %s, now(), %s)
+ON CONFLICT (report_id) DO UPDATE SET
+  template_id   = EXCLUDED.template_id,
+  processed_at  = now(),
+  items_written = EXCLUDED.items_written;
+"""
+
+# -------------------------------------------------------------------
+# Candidates
+# NOTE: All candidates exclude reports already marked as done.
+#       This is the only robust way to avoid loops for items=0 cases.
+# -------------------------------------------------------------------
+
 SQL_COUNT_CANDIDATES = """
 SELECT COUNT(*) AS c
 FROM core.ruz_reports r
@@ -25,7 +57,10 @@ LEFT JOIN core.ruz_report_items i ON i.report_id = r.id
 WHERE r.id_sablony IS NOT NULL
   AND o.legal_form_code = ANY(%s)
   AND r.tabulky IS NOT NULL
-  AND i.report_id IS NULL;
+  AND i.report_id IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM core.ruz_report_items_done d WHERE d.report_id = r.id
+  );
 """
 
 SQL_FETCH_CANDIDATES = """
@@ -42,6 +77,9 @@ WHERE r.id_sablony IS NOT NULL
   AND o.legal_form_code = ANY(%s)
   AND r.tabulky IS NOT NULL
   AND i.report_id IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM core.ruz_report_items_done d WHERE d.report_id = r.id
+  )
   AND r.id > %s
 ORDER BY r.id
 LIMIT %s;
@@ -56,7 +94,10 @@ WHERE r.id_sablony IS NOT NULL
   AND o.legal_form_code = ANY(%s)
   AND r.tabulky IS NOT NULL
   AND i.report_id IS NULL
-  AND r.id_sablony = ANY(%s);
+  AND r.id_sablony = ANY(%s)
+  AND NOT EXISTS (
+      SELECT 1 FROM core.ruz_report_items_done d WHERE d.report_id = r.id
+  );
 """
 
 SQL_FETCH_CANDIDATES_TPL = """
@@ -74,12 +115,15 @@ WHERE r.id_sablony IS NOT NULL
   AND r.tabulky IS NOT NULL
   AND i.report_id IS NULL
   AND r.id_sablony = ANY(%s)
+  AND NOT EXISTS (
+      SELECT 1 FROM core.ruz_report_items_done d WHERE d.report_id = r.id
+  )
   AND r.id > %s
 ORDER BY r.id
 LIMIT %s;
 """
 
-# NEW: explicit report_ids backfill mode (does not use state cursor)
+# Explicit report_ids backfill mode (does not use state cursor)
 SQL_COUNT_CANDIDATES_BY_IDS = """
 SELECT COUNT(*) AS c
 FROM core.ruz_reports r
@@ -88,7 +132,11 @@ WHERE r.id = ANY(%s)
   AND o.legal_form_code = ANY(%s)
   AND r.tabulky IS NOT NULL
   AND NOT EXISTS (
-      SELECT 1 FROM core.ruz_report_items i WHERE i.report_id = r.id);
+      SELECT 1 FROM core.ruz_report_items i WHERE i.report_id = r.id
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM core.ruz_report_items_done d WHERE d.report_id = r.id
+  );
 """
 
 SQL_FETCH_CANDIDATES_BY_IDS = """
@@ -106,6 +154,9 @@ WHERE r.id = ANY(%s)
   AND NOT EXISTS (
       SELECT 1 FROM core.ruz_report_items i WHERE i.report_id = r.id
   )
+  AND NOT EXISTS (
+      SELECT 1 FROM core.ruz_report_items_done d WHERE d.report_id = r.id
+  )
 ORDER BY r.id
 LIMIT %s;
 """
@@ -116,8 +167,6 @@ FROM core.ruz_templates
 WHERE id = %s;
 """
 
-# Removed row_text from writes (do not store it; can be derived from template rows).
-# Keep oznacenie as optional lightweight code; if you also want to drop it, remove similarly.
 SQL_UPSERT_ITEM = """
 INSERT INTO core.ruz_report_items (
   report_id, template_id, ico, pravna_forma, obdobie_do,
@@ -268,7 +317,7 @@ def _build_rows_meta_with_offset(
     Returns:
       - rows_meta_ozn: {global_row_number -> oznacenie}
       - offset: global = local + offset
-      - max_rows_effective: capped local row count so we don't go past template max row number :)
+      - max_rows_effective: capped local row count so we don't go past template max row number
     """
     rows_meta_ozn: Dict[int, Optional[str]] = {}
     min_tpl_rn: Optional[int] = None
@@ -289,7 +338,6 @@ def _build_rows_meta_with_offset(
 
         rows_meta_ozn[rn] = _safe_str(rr.get("oznacenie"))
 
-    # Detect tables where template row numbers are globally numbered (e.g., 79..145)
     offset = 0
     if min_tpl_rn is not None and min_tpl_rn > 1 and (1 not in rows_meta_ozn):
         offset = min_tpl_rn - 1
@@ -319,7 +367,6 @@ def run_sync(
 
     tpl_ids = _normalize_template_ids(template_ids)
 
-    # normalize report_ids to list[int] if provided
     report_ids_list: Optional[List[int]] = None
     if report_ids is not None:
         report_ids_list = [int(x) for x in report_ids if x is not None]
@@ -329,7 +376,9 @@ def run_sync(
     with get_conn(row_factory=dict_row) as conn:
         ensure_schema(conn)
 
-        # state cursor only applies to NORMAL mode (no explicit report_ids)
+        # NEW: ensure "done" marker table exists
+        conn.execute(SQL_CREATE_DONE_TABLE)
+
         last_id = 0
         if use_state_cursor and report_ids_list is None:
             st = conn.execute(SQL_GET_STATE).fetchone() or {"last_report_id": 0}
@@ -338,10 +387,11 @@ def run_sync(
             except Exception:
                 last_id = 0
 
-        # candidate count: depends on mode
         if report_ids_list is not None:
             total_candidates = int(
-                (conn.execute(SQL_COUNT_CANDIDATES_BY_IDS, (report_ids_list, list(legal_forms))).fetchone() or {"c": 0})["c"]
+                (conn.execute(SQL_COUNT_CANDIDATES_BY_IDS, (report_ids_list, list(legal_forms))).fetchone() or {"c": 0})[
+                    "c"
+                ]
             )
         else:
             if tpl_ids:
@@ -349,9 +399,7 @@ def run_sync(
                     (conn.execute(SQL_COUNT_CANDIDATES_TPL, (list(legal_forms), tpl_ids)).fetchone() or {"c": 0})["c"]
                 )
             else:
-                total_candidates = int(
-                    (conn.execute(SQL_COUNT_CANDIDATES, (list(legal_forms),)).fetchone() or {"c": 0})["c"]
-                )
+                total_candidates = int((conn.execute(SQL_COUNT_CANDIDATES, (list(legal_forms),)).fetchone() or {"c": 0})["c"])
 
         log.info(
             "Candidate reports=%d | legal_forms=%s | template_ids=%s | mode=%s | start_last_id=%d",
@@ -366,14 +414,11 @@ def run_sync(
             if hard_limit is not None and total_reports >= hard_limit:
                 break
 
-            # BACKFILL MODE: explicit report_ids (does not use last_id cursor)
             if report_ids_list is not None:
                 batch = conn.execute(
                     SQL_FETCH_CANDIDATES_BY_IDS,
                     (report_ids_list, list(legal_forms), batch_size),
                 ).fetchall()
-
-            # NORMAL MODE: cursor-based
             else:
                 if tpl_ids:
                     batch = conn.execute(
@@ -389,23 +434,27 @@ def run_sync(
             if not batch:
                 break
 
-            # for logging / progress only; state update is conditional below
             last_id = int(batch[-1]["report_id"])
 
             with conn.transaction():
                 with conn.cursor() as cur:
                     for r in batch:
+                        if hard_limit is not None and total_reports >= hard_limit:
+                            break
+
                         rid = int(r["report_id"])
                         tid = int(r["template_id"])
+                        items_written_report = 0
 
+                        # template
                         tpl_row = cur.execute(SQL_FETCH_TEMPLATE_RAW, (tid,)).fetchone()
                         tpl_raw = tpl_row.get("tpl_raw") if tpl_row else None
 
                         tpl = _load_template_payload(tpl_raw, template_id=tid, report_id=rid)
                         if not tpl:
+                            # IMPORTANT: mark done even if template missing/invalid to avoid infinite retries
+                            cur.execute(SQL_MARK_DONE, (rid, tid, 0))
                             total_reports += 1
-                            if hard_limit is not None and total_reports >= hard_limit:
-                                break
                             continue
 
                         titulna = r.get("titulna") or {}
@@ -416,9 +465,8 @@ def run_sync(
                         ico = _safe_str(r.get("ico"))
 
                         if not isinstance(tabulky, list):
+                            cur.execute(SQL_MARK_DONE, (rid, tid, 0))
                             total_reports += 1
-                            if hard_limit is not None and total_reports >= hard_limit:
-                                break
                             continue
 
                         for table_idx, t in enumerate(tabulky):
@@ -442,7 +490,7 @@ def run_sync(
                                 continue
 
                             for local_row_number in range(1, max_rows_effective + 1):
-                                row_number = local_row_number + offset  # global/template row number
+                                row_number = local_row_number + offset
                                 oznacenie = rows_meta_ozn.get(row_number)
 
                                 for period_col in range(1, data_cols + 1):
@@ -451,7 +499,6 @@ def run_sync(
                                         continue
 
                                     val_num = _parse_decimal(data[idx])
-
                                     if val_num is None:
                                         continue
 
@@ -472,12 +519,13 @@ def run_sync(
                                         },
                                     )
                                     total_items += 1
+                                    items_written_report += 1
+
+                        # NEW: mark done even if items_written_report == 0
+                        cur.execute(SQL_MARK_DONE, (rid, tid, items_written_report))
 
                         total_reports += 1
-                        if hard_limit is not None and total_reports >= hard_limit:
-                            break
 
-                # Update cursor state ONLY in normal mode (no report_ids) and only if enabled
                 if update_state and use_state_cursor and report_ids_list is None:
                     conn.execute(SQL_SET_STATE, (last_id,))
 

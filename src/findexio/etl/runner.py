@@ -17,11 +17,9 @@ from . import (
 )
 from ..ml.pd_model import run as ml_pd_run
 
-# NEW: Slovensko.Digital (Datahub) enrichment
+# Slovensko.Digital (Datahub) enrichment
 from .sd_org import run_sync as sd_org_sync
 
-# NEW: report items test module (writes into core.ruz_report_items_test)
-#from . import ruz_report_items_test
 
 
 def _setup_logging_if_needed() -> None:
@@ -99,7 +97,7 @@ def daily() -> None:
     # rpo_bulk.run_full_sync(apply_daily=True)    # REGISTER PRAVNICKYCH OSOB
     # ruz_units.run_sync()                        # UCTOVNE JEDNOTKY
     # ruz_statements.run_sync(refresh_all=False)  # UCTOVNE ZAVIERKY PRE JEDNOTLIVE UCTOVNE JEDNOTKY
-    ruz_reports.run_sync(refresh_all=False, template_id_only=(699,687,22,21), candidate_limit=600000, reset_cursor=True)  # OBSAH UCTOVNYCH ZAVIEROK
+    ruz_reports.run_sync(refresh_all=False, template_id_only=(699,687,22,21), candidate_limit=600000)  # OBSAH UCTOVNYCH ZAVIEROK
 
     # log.info("Running ruz_templates...")
     # ruz_templates.run_sync()                    # SABLONY PRE OBSAH UCTOVNYCH ZAVIEROK
@@ -125,7 +123,7 @@ def update02() -> None:
     ruz_templates.run_sync()
 
     log.info("Running ruz_report_items (legal_forms=112,121)...")
-    ruz_report_items.run_sync(legal_forms=("112", "121"), template_ids=699, hard_limit=50000, use_state_cursor=False)
+    ruz_report_items.run_sync(legal_forms=("112", "121"), template_ids=(699,687,21,22), hard_limit=50000, use_state_cursor=False)
 
     log.info("V0.2 update finished.")
 
@@ -195,7 +193,7 @@ def backfill_report_items_year(*, year: int = 2024) -> None:
               FROM core.ruz_reports r
               LEFT JOIN core.ruz_report_items i
                 ON i.report_id = r.id
-              WHERE r.id_sablony = 699
+              WHERE r.id_sablony IN(699,687,21,22)
                 AND (r.titulna->>'obdobieDo') LIKE %s
                 AND i.report_id IS NULL
             )
@@ -214,7 +212,7 @@ def backfill_report_items_year(*, year: int = 2024) -> None:
 
     ruz_report_items.run_sync(
         legal_forms=("112", "121"),
-        template_ids=699,
+        template_ids=(699,687,22,21),
         report_ids=report_ids,
         hard_limit=50000,
         # 🔒 CRITICAL
@@ -223,27 +221,6 @@ def backfill_report_items_year(*, year: int = 2024) -> None:
     )
 
     log.info("BACKFILL %s finished.", year)
-
-"""
-def test_items(*, per_template: int = 10, truncate_first: bool = True) -> None:
-    
-    Production-safe test extractor:
-      - Writes ONLY into core.ruz_report_items_test
-      - Samples:
-          per_template x 699
-          per_template x 687
-          per_template paired statements => ~2*per_template reports of 21 and 22
-      - Does NOT touch ruz_report_items_state
-    
-    #ensure_db()
-    log.info("Starting TEST_ITEMS: per_template=%s truncate_first=%s", per_template, truncate_first)
-    ruz_report_items_test.run_test_insert(
-        per_template=per_template,
-        legal_forms=("112", "121"),
-        truncate_first=truncate_first,
-    )
-    log.info("TEST_ITEMS finished.")
-"""
 
 def ml_run() -> None:
     """
