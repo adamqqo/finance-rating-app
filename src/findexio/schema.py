@@ -283,4 +283,37 @@ CREATE TABLE IF NOT EXISTS core.sd_org_successor (
     successor_terminated_on DATE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- =====================================
+-- MVSR Address dataset
+-- =====================================
+
+DROP TABLE IF EXISTS core.mvsr_addresses;
+
+CREATE TABLE core.mvsr_addresses (
+    identifikator TEXT PRIMARY KEY,
+
+    kraj TEXT,
+    okres TEXT,
+    obec TEXT,
+    cast_obce TEXT,
+
+    ulica TEXT,
+    supisne_cislo TEXT,
+    orientacne_cislo TEXT,
+
+    psc TEXT,
+
+    adr_x NUMERIC(10,6),
+    adr_y NUMERIC(10,6)
+);
+
+CREATE INDEX idx_mvsr_addresses_psc
+    ON core.mvsr_addresses(psc);
+
+CREATE INDEX idx_mvsr_addresses_obec
+    ON core.mvsr_addresses(obec);
+
+CREATE INDEX idx_mvsr_addresses_okres
+    ON core.mvsr_addresses(okres);
 """
