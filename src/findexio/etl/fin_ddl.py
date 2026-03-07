@@ -110,8 +110,14 @@ CREATE TABLE IF NOT EXISTS core.fin_annual_aggregates
 
 TABLESPACE pg_default;
 
-ALTER TABLE IF EXISTS core.fin_annual_aggregates
-    OWNER to postgres;
+ALTER
+TABLE
+IF
+EXISTS
+core.fin_annual_aggregates
+OWNER
+to
+postgres;
 
 -- Index: ix_faa_ico_year_norm
 
@@ -302,6 +308,22 @@ CREATE INDEX IF NOT EXISTS ix_fhg_ico_year
     (ico COLLATE pg_catalog."default" ASC NULLS LAST, fiscal_year ASC NULLS LAST)
     WITH (fillfactor=100, deduplicate_items=True)
     TABLESPACE pg_default;
+    
+    -- Grades: často čítané podľa ico + norm_period + rok
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_fin_health_grade_ico_np_year
+  ON core.fin_health_grade (ico, norm_period, fiscal_year);
+
+-- Latest features (DESC LIMIT 1) + series
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_fin_annual_features_ico_np_year
+  ON core.fin_annual_features (ico, norm_period, fiscal_year);
+
+-- Aggregates series
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_fin_annual_aggregates_ico_np_year
+  ON core.fin_annual_aggregates (ico, norm_period, fiscal_year);
+
+-- PD: filteruješ podľa ico + model_id + year
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_ml_pd_predictions_model_ico_year
+  ON core.ml_pd_predictions (model_id, ico, fiscal_year);
 """
 
 

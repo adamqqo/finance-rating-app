@@ -922,7 +922,8 @@ WHERE g.report_id = d.report_id
 """
 
 SQL_REFRESH_MV_TOP10_BY_GRADE_YEAR = "REFRESH MATERIALIZED VIEW core.mv_top10_by_grade_year;"
-
+SQL_REFRESH_MV_COMPANY_BENCHMARK_DIM = "REFRESH MATERIALIZED VIEW core.mv_company_benchmark_dim;"
+SQL_REFRESH_MV_COMPANY_BENCHMARK_FACT = "REFRESH MATERIALIZED VIEW core.mv_company_benchmark_facts;"
 
 def _fetch_batch_single(conn, limit: int) -> List[int]:
     rows = conn.execute(SQL_FETCH_BATCH_SINGLE, (limit,)).fetchall()
@@ -1012,6 +1013,8 @@ def run(rebuild: bool = True) -> None:
         # Post-commit MV refresh (nice-to-have)
         try:
             conn.execute(SQL_REFRESH_MV_TOP10_BY_GRADE_YEAR)
+            conn.execute(SQL_REFRESH_MV_COMPANY_BENCHMARK_DIM)
+            conn.execute(SQL_REFRESH_MV_COMPANY_BENCHMARK_FACT)
             conn.commit()
         except Exception:
             conn.rollback()

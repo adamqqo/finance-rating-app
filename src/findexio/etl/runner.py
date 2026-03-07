@@ -90,29 +90,58 @@ def daily() -> None:
     Note:
       Keeping the same order ensures templates/report_items stay in sync with newly fetched reports,
       and SD enrichment runs after base data is present.
+
+    DEMO MODE: All limits are intentionally small for showcase/testing purposes.
     """
     ensure_db()
-    log.info("Starting DAILY pipeline...")
+    log.info("Starting DAILY pipeline (DEMO MODE - limited processing)...")
 
-    # rpo_bulk.run_full_sync(apply_daily=True)    # REGISTER PRAVNICKYCH OSOB
-    # ruz_units.run_sync()                        # UCTOVNE JEDNOTKY
-    # ruz_statements.run_sync(refresh_all=False)  # UCTOVNE ZAVIERKY PRE JEDNOTLIVE UCTOVNE JEDNOTKY
-    ruz_reports.run_sync(refresh_all=False, template_id_only=(699,687,22,21), candidate_limit=600000)  # OBSAH UCTOVNYCH ZAVIEROK
+    # RPO: Process max 50 daily updates
+    log.info("Running rpo_bulk (max 50 daily updates)...")
+    rpo_bulk.run_full_sync(apply_daily=True, max_daily=50)
 
-    # log.info("Running ruz_templates...")
-    # ruz_templates.run_sync()                    # SABLONY PRE OBSAH UCTOVNYCH ZAVIEROK
+    # RUZ Units: Process max 100 units
+    log.info("Running ruz_units (max 100 units)...")
+    ruz_units.run_sync(limit_ids=100)
 
-    # log.info("Running ruz_report_items (legal_forms=112,121)...")
-    # ruz_report_items.run_sync(legal_forms=("112", "121",), hard_limit=100000,use_state_cursor=False)  # NAPAROVANIE SABLON S OBSAHOM UCTOVNYCH ZAVIEROK
+    # RUZ Statements: Process max 200 statements
+    log.info("Running ruz_statements (max 200 statements)...")
+    ruz_statements.run_sync(refresh_all=False, hard_limit=200)
 
-    # SD enrichment (incremental)
-    # log.info("Running sd_org (Slovensko.Digital enrichment)...")
-    # sd_org_sync()
+    # RUZ Reports: Process max 200 reports for templates 699,687,21,22
+    log.info("Running ruz_reports (max 200 reports)...")
+    ruz_reports.run_sync(
+        refresh_all=False,
+        template_id_only=(699, 687, 22, 21),
+        candidate_limit=200,
+        hard_limit=200
+    )
 
-    # log.info("Running FIN_ETL...")
-    # fin_etl.run()
+    # RUZ Templates: Sync all templates (usually small dataset)
+    log.info("Running ruz_templates...")
+    ruz_templates.run_sync(hard_limit=50)
 
-    log.info("DAILY finished.")
+    # RUZ Report Items: Process max 500 report items
+    log.info("Running ruz_report_items (max 500 items, legal_forms=112,121)...")
+    ruz_report_items.run_sync(
+        legal_forms=("112", "121"),
+        hard_limit=500,
+        use_state_cursor=True
+    )
+
+    # SD enrichment: Process max 100 organizations
+    log.info("Running sd_org (max 100 orgs)...")
+    sd_org_sync(hard_limit=100)
+
+    # Financial ETL: Process all available data (incremental by design)
+    log.info("Running FIN_ETL...")
+    fin_etl.run()
+
+    # ML PD Pipeline: Train model and score companies for default probability
+    log.info("Running ML PD (Probability of Default) pipeline...")
+    ml_pd_run()
+
+    log.info("DAILY finished (DEMO MODE).")
 
 
 def update02() -> None:
