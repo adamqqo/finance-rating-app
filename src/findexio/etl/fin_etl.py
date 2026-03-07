@@ -61,16 +61,6 @@ INSERT INTO core.fin_etl_queue_single (report_id)
 SELECT DISTINCT i.report_id
 FROM core.ruz_report_items i
 WHERE i.template_id IN (699, 687)
-  AND (
-    -- 699 filter (as original)
-    (i.template_id = 699 AND (
-         (i.table_name = 'Strana aktív' AND i.period_col IN (3,4))
-      OR (i.table_name <> 'Strana aktív' AND i.period_col IN (1,2))
-    ))
-    OR
-    -- 687: only 1/2 everywhere
-    (i.template_id = 687 AND i.period_col IN (1,2))
-  )
 ON CONFLICT DO NOTHING;
 """
 
@@ -92,10 +82,6 @@ WITH bs AS (
   JOIN core.ruz_reports r ON r.id = i.report_id
   WHERE i.template_id = 21
     AND core.parse_ruztxt_date(i.obdobie_do) IS NOT NULL
-    AND (
-         (i.table_name = 'Strana aktív' AND i.period_col IN (3,4))
-      OR (i.table_name <> 'Strana aktív' AND i.period_col IN (1,2))
-    )
 ),
 isr AS (
   SELECT DISTINCT
@@ -113,10 +99,6 @@ isr AS (
   JOIN core.ruz_reports r ON r.id = i.report_id
   WHERE i.template_id = 22
     AND core.parse_ruztxt_date(i.obdobie_do) IS NOT NULL
-    AND (
-         (i.table_name = 'Strana aktív' AND i.period_col IN (3,4))
-      OR (i.table_name <> 'Strana aktív' AND i.period_col IN (1,2))
-    )
 ),
 pairs AS (
   SELECT
