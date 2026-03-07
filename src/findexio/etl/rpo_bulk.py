@@ -618,6 +618,7 @@ def run_full_sync(
     reset_daily: bool = False,
     reset_all: bool = False,
     backfill_missing_legal_form_fields: bool = True,
+    allow_reinit_on_new_snapshot: bool = False,
 ) -> None:
     with get_conn(row_factory=dict_row) as conn:
         ensure_schema(conn)
@@ -633,11 +634,19 @@ def run_full_sync(
             conn.commit()
 
         if reset_init and not reset_all:
-            conn.execute("UPDATE core.rpo_bulk_state SET last_init_key = NULL, last_run_at = now() WHERE id = 1;")
+            conn.execute(
+                "UPDATE core.rpo_bulk_state "
+                "SET last_init_key = NULL, last_run_at = now() "
+                "WHERE id = 1;"
+            )
             conn.commit()
 
         if reset_daily and not reset_all:
-            conn.execute("UPDATE core.rpo_bulk_state SET last_daily_key = NULL, last_run_at = now() WHERE id = 1;")
+            conn.execute(
+                "UPDATE core.rpo_bulk_state "
+                "SET last_daily_key = NULL, last_run_at = now() "
+                "WHERE id = 1;"
+            )
             conn.commit()
 
         if backfill_missing_legal_form_fields:
@@ -649,37 +658,112 @@ def run_full_sync(
         last_init_key = st["last_init_key"]
         last_daily_key = st["last_daily_key"]
 
-        # INIT selection
+        # -------------------------------------------------
+        # INIT stage
+        # -------------------------------------------------
         objs_init = list_objects(PREFIX_INIT)
-        pinned_date = _init_date_from_key(last_init_key) if last_init_key else None
-        init_date_str, init_keys = init_keys_for_date(objs_init, pinned_date=pinned_date)
-        init_date = datetime.strptime(init_date_str, "%Y-%m-%d")
 
-        # Continue INIT from last_init_key
+        pat = re.compile(r"^batch-init/init_(\d{4}-\d{2}-\d{2})_(\d+)\.json\.gz$")
+        by_date: Dict[str, List[Tuple[int, str]]] = {}
+        for o in objs_init:
+            k = o["Key"]
+            m = pat.match(k)
+            if not m:
+                continue
+            d, seq = m.group(1), int(m.group(2))
+            by_date.setdefault(d, []).append((seq, k))
+
+        if not by_date:
+            raise RuntimeError("Nenašli sa žiadne 'batch-init' súbory.")
+
+        available_init_dates = sorted(by_date.keys())
+        latest_init_date = available_init_dates[-1]
+
+        init_date_str: Optional[str] = None
+        init_keys: List[str] = []
         init_start = 0
-        if last_init_key and last_init_key in init_keys:
-            init_start = init_keys.index(last_init_key) + 1
+        should_run_init = False
 
-        if init_start < len(init_keys):
+        pinned_date = _init_date_from_key(last_init_key) if last_init_key else None
+
+        if last_init_key is None:
+            # Fresh DB / no init state yet -> run latest INIT
+            init_date_str = latest_init_date
+            init_keys = [k for _, k in sorted(by_date[init_date_str])]
+            init_start = 0
+            should_run_init = True
+            log.info("No last_init_key found. Starting INIT snapshot %s.", init_date_str)
+
+        elif pinned_date in by_date:
+            # Previous INIT snapshot still exists -> continue if unfinished
+            init_date_str = pinned_date
+            init_keys = [k for _, k in sorted(by_date[init_date_str])]
+
+            if last_init_key in init_keys:
+                init_start = init_keys.index(last_init_key) + 1
+            else:
+                init_start = 0
+
+            if init_start < len(init_keys):
+                should_run_init = True
+                log.info(
+                    "Continuing INIT snapshot %s from batch %d/%d.",
+                    init_date_str,
+                    init_start + 1,
+                    len(init_keys),
+                )
+            else:
+                log.info("INIT %s already applied.", init_date_str)
+
+        else:
+            # Previous INIT snapshot no longer exists in S3
+            if allow_reinit_on_new_snapshot:
+                init_date_str = latest_init_date
+                init_keys = [k for _, k in sorted(by_date[init_date_str])]
+                init_start = 0
+                should_run_init = True
+                log.warning(
+                    "Previous INIT snapshot date %s is no longer available. "
+                    "Starting latest INIT snapshot %s because allow_reinit_on_new_snapshot=True.",
+                    pinned_date,
+                    init_date_str,
+                )
+            else:
+                log.warning(
+                    "Previous INIT snapshot date %s is no longer available in S3. "
+                    "Skipping automatic re-INIT. Existing DB state will be kept.",
+                    pinned_date,
+                )
+
+        if should_run_init:
             for key in init_keys[init_start:]:
                 log.info("Downloading INIT %s", key)
                 apply_batch_to_db(key, conn)
                 conn.execute(SQL_SET_INIT, (key,))
                 conn.commit()
-        else:
-            log.info("INIT %s already applied.", init_date_str)
 
+        # -------------------------------------------------
+        # DAILY stage
+        # -------------------------------------------------
         if not apply_daily:
             return
 
-        # DAILY newer than INIT date
         objs_daily = list_objects(PREFIX_DAILY)
         keys_daily_all = daily_keys_sorted(objs_daily)
         if not keys_daily_all:
             log.info("No batch-daily files.")
             return
 
-        keys_daily = [k for k in keys_daily_all if (_export_date_from_daily_key(k) or datetime.min) > init_date]
+        # Use INIT date only if we actually have one; otherwise allow all daily files
+        if init_date_str:
+            init_date = datetime.strptime(init_date_str, "%Y-%m-%d")
+            keys_daily = [
+                k for k in keys_daily_all
+                if (_export_date_from_daily_key(k) or datetime.min) > init_date
+            ]
+        else:
+            keys_daily = keys_daily_all
+
         if not keys_daily:
             log.info("No DAILY newer than INIT.")
             return
