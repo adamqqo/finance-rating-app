@@ -288,7 +288,7 @@ CREATE TABLE IF NOT EXISTS core.sd_org_successor (
 -- MVSR Address dataset
 -- =====================================
 
-DROP TABLE IF EXISTS core.mvsr_addresses;
+--DROP TABLE IF EXISTS core.mvsr_addresses;
 
 CREATE TABLE core.mvsr_addresses (
     identifikator TEXT PRIMARY KEY,
