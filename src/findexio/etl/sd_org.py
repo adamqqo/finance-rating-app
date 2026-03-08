@@ -286,8 +286,8 @@ def _allowed_icos_from_rpo_all_orgs(icos: List[int]) -> set[int]:
             """
             SELECT ico
             FROM core.rpo_all_orgs
-            WHERE ico = ANY(%s)
-              AND legal_form_code = ANY(%s)
+            WHERE ico = ANY(%s::text[])
+              AND legal_form_code = ANY(%s::text[])
             """,
             (icos, list(ALLOWED_LEGAL_FORMS)),
         ).fetchall()

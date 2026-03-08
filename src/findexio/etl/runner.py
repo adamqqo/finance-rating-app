@@ -130,8 +130,8 @@ def daily() -> None:
     )
 
     # SD enrichment: Process max 100 organizations
-    log.info("Running sd_org (max 100 orgs)...")
-    sd_org_sync(hard_limit=100)
+    log.info("Running sd_org (max 10 orgs)...")
+    sd_org_sync(hard_limit=10)
 
     # Financial ETL: Process all available data (incremental by design)
     log.info("Running FIN_ETL...")
@@ -141,7 +141,7 @@ def daily() -> None:
     log.info("Running ML PD (Probability of Default) pipeline...")
     ml_pd_run()
 
-    log.info("DAILY finished (DEMO MODE).")
+    log.info("DAILY pipeline finished (DEMO MODE).")
 
 
 def update02() -> None:
