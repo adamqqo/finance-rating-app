@@ -510,7 +510,7 @@ def _db_upsert_batch(
                 # reset current flags only for touched ICOs
                 ico_set = sorted({r["ico"] for r in address_rows})
                 cur.execute(
-                    "UPDATE core.sd_org_address SET is_current = FALSE WHERE ico = ANY(%s::text[])",
+                    "UPDATE core.sd_org_address SET is_current = FALSE WHERE ico = ANY(%s::bigint[])",
                     (ico_set,),
                 )
                 cur.executemany(SQL_UPSERT_ADDRESS, address_rows)
