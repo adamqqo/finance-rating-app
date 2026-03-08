@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 
 from ..db import get_conn, ensure_schema
 from . import (
@@ -99,14 +100,17 @@ def daily() -> None:
     # RPO: Process max 50 daily updates
     log.info("Running rpo_bulk (max 50 daily updates)...")
     rpo_bulk.run_full_sync(apply_daily=True, max_daily=50)
+    time.sleep(5)
 
     # RUZ Units: Process max 100 units
     log.info("Running ruz_units (max 100 units)...")
     ruz_units.run_sync(limit_ids=100)
+    time.sleep(5)
 
     # RUZ Statements: Process max 200 statements
     log.info("Running ruz_statements (max 200 statements)...")
     ruz_statements.run_sync(refresh_all=False, hard_limit=200)
+    time.sleep(5)
 
     # RUZ Reports: Process max 200 reports for templates 699,687,21,22
     log.info("Running ruz_reports (max 200 reports)...")
@@ -116,10 +120,12 @@ def daily() -> None:
         candidate_limit=200,
         hard_limit=200
     )
+    time.sleep(5)
 
     # RUZ Templates: Sync all templates (usually small dataset)
     log.info("Running ruz_templates...")
     ruz_templates.run_sync(hard_limit=50)
+    time.sleep(5)
 
     # RUZ Report Items: Process max 500 report items
     log.info("Running ruz_report_items (max 500 items, legal_forms=112,121)...")
@@ -128,14 +134,17 @@ def daily() -> None:
         hard_limit=500,
         use_state_cursor=True
     )
+    time.sleep(5)
 
     # SD enrichment: Process max 100 organizations
     log.info("Running sd_org (max 10 orgs)...")
     sd_org_sync(hard_limit=10)
+    time.sleep(5)
 
     # Financial ETL: Process all available data (incremental by design)
     log.info("Running FIN_ETL...")
     fin_etl.run(rebuild=False)
+    time.sleep(5)
 
     # ML PD Pipeline: Train model and score companies for default probability
     log.info("Running ML PD (Probability of Default) pipeline...")
