@@ -135,7 +135,7 @@ def daily() -> None:
 
     # Financial ETL: Process all available data (incremental by design)
     log.info("Running FIN_ETL...")
-    fin_etl.run()
+    fin_etl.run(rebuild=False)
 
     # ML PD Pipeline: Train model and score companies for default probability
     log.info("Running ML PD (Probability of Default) pipeline...")
@@ -184,7 +184,7 @@ def fin_etl_run() -> None:
     """
     ensure_db()
     log.info("Starting FIN_ETL...")
-    fin_etl.run()
+    fin_etl.run(rebuild=False)
     log.info("FIN_ETL finished.")
 
 

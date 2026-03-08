@@ -13,6 +13,9 @@ log = logging.getLogger("findexio.fin_etl")
 BATCH_SIZE_SINGLE = 5000   # 699 + 687 report_id batch
 BATCH_SIZE_PAIRS = 5000    # number of (21,22) pairs per batch
 
+def _fetch_model_sk_pct_years(conn) -> List[int]:
+    rows = conn.execute(SQL_GET_MODEL_SK_PCT_YEARS).fetchall()
+    return [r[0] for r in rows]
 # -----------------------------
 # Rebuild truncates
 # -----------------------------
@@ -58,66 +61,108 @@ CREATE INDEX IF NOT EXISTS ix_fin_etl_pairs_key ON core.fin_etl_pairs (ico, stat
 # 699 + 687: queue report_ids directly (using minimal filters to avoid useless rows)
 SQL_POPULATE_QUEUE_SINGLE = """
 INSERT INTO core.fin_etl_queue_single (report_id)
-SELECT DISTINCT i.report_id
-FROM core.ruz_report_items i
-WHERE i.template_id IN (699, 687)
+SELECT d.report_id
+FROM core.ruz_report_items_done d
+WHERE d.template_id IN (699, 687)
 ON CONFLICT DO NOTHING;
 """
 
 # 21/22: build strict pairs into core.fin_etl_pairs
 SQL_POPULATE_PAIRS_21_22 = """
-WITH bs AS (
-  SELECT DISTINCT
-    i.report_id AS bs_report_id,
-    i.ico,
-    r.id_uctovnej_zavierky AS statement_id,
-    core.parse_ruztxt_date(i.obdobie_do) AS period_end,
-    CASE
-      WHEN i.table_name = 'Strana aktív' AND i.period_col = 3 THEN 1
-      WHEN i.table_name = 'Strana aktív' AND i.period_col = 4 THEN 2
-      WHEN i.table_name <> 'Strana aktív' AND i.period_col = 1 THEN 1
-      WHEN i.table_name <> 'Strana aktív' AND i.period_col = 2 THEN 2
-    END AS norm_period
-  FROM core.ruz_report_items i
-  JOIN core.ruz_reports r ON r.id = i.report_id
-  WHERE i.template_id = 21
-    AND core.parse_ruztxt_date(i.obdobie_do) IS NOT NULL
+WITH done_21 AS (
+  SELECT d.report_id
+  FROM core.ruz_report_items_done d
+  WHERE d.template_id = 21
+),
+done_22 AS (
+  SELECT d.report_id
+  FROM core.ruz_report_items_done d
+  WHERE d.template_id = 22
+),
+bs AS (
+  SELECT
+    r.id AS bs_report_id,
+    r.ico,
+    r.id_uctovnej_zavierky AS statement_id
+  FROM core.ruz_reports r
+  JOIN done_21 d ON d.report_id = r.id
 ),
 isr AS (
-  SELECT DISTINCT
-    i.report_id AS is_report_id,
-    i.ico,
-    r.id_uctovnej_zavierky AS statement_id,
-    core.parse_ruztxt_date(i.obdobie_do) AS period_end,
-    CASE
-      WHEN i.table_name = 'Strana aktív' AND i.period_col = 3 THEN 1
-      WHEN i.table_name = 'Strana aktív' AND i.period_col = 4 THEN 2
-      WHEN i.table_name <> 'Strana aktív' AND i.period_col = 1 THEN 1
-      WHEN i.table_name <> 'Strana aktív' AND i.period_col = 2 THEN 2
-    END AS norm_period
-  FROM core.ruz_report_items i
-  JOIN core.ruz_reports r ON r.id = i.report_id
-  WHERE i.template_id = 22
-    AND core.parse_ruztxt_date(i.obdobie_do) IS NOT NULL
+  SELECT
+    r.id AS is_report_id,
+    r.ico,
+    r.id_uctovnej_zavierky AS statement_id
+  FROM core.ruz_reports r
+  JOIN done_22 d ON d.report_id = r.id
 ),
-pairs AS (
+candidate_pairs AS (
   SELECT
     bs.bs_report_id,
     isr.is_report_id,
     bs.ico,
-    bs.statement_id,
-    bs.period_end,
-    bs.norm_period
+    bs.statement_id
   FROM bs
   JOIN isr
     ON isr.ico = bs.ico
    AND isr.statement_id = bs.statement_id
-   AND isr.period_end = bs.period_end
-   AND isr.norm_period = bs.norm_period
-  WHERE bs.norm_period IS NOT NULL
+),
+pairs AS (
+  SELECT
+    cp.bs_report_id,
+    cp.is_report_id,
+    cp.ico,
+    cp.statement_id,
+    p.period_end,
+    np.norm_period
+  FROM candidate_pairs cp
+  JOIN LATERAL (
+    SELECT core.parse_ruztxt_date(i.obdobie_do) AS period_end
+    FROM core.ruz_report_items i
+    WHERE i.report_id = cp.bs_report_id
+      AND i.obdobie_do IS NOT NULL
+      AND core.parse_ruztxt_date(i.obdobie_do) IS NOT NULL
+    LIMIT 1
+  ) p ON TRUE
+  CROSS JOIN (VALUES (1), (2)) AS np(norm_period)
+  WHERE EXISTS (
+      SELECT 1
+      FROM core.ruz_report_items i
+      WHERE i.report_id = cp.bs_report_id
+        AND (
+              (np.norm_period = 1 AND (
+                  (i.table_name = 'Strana aktív' AND i.period_col = 3) OR
+                  (i.table_name <> 'Strana aktív' AND i.period_col = 1)
+              ))
+           OR (np.norm_period = 2 AND (
+                  (i.table_name = 'Strana aktív' AND i.period_col = 4) OR
+                  (i.table_name <> 'Strana aktív' AND i.period_col = 2)
+              ))
+            )
+  )
+    AND EXISTS (
+      SELECT 1
+      FROM core.ruz_report_items i
+      WHERE i.report_id = cp.is_report_id
+        AND (
+              (np.norm_period = 1 AND (
+                  (i.table_name = 'Strana aktív' AND i.period_col = 3) OR
+                  (i.table_name <> 'Strana aktív' AND i.period_col = 1)
+              ))
+           OR (np.norm_period = 2 AND (
+                  (i.table_name = 'Strana aktív' AND i.period_col = 4) OR
+                  (i.table_name <> 'Strana aktív' AND i.period_col = 2)
+              ))
+            )
+  )
 )
 INSERT INTO core.fin_etl_pairs (bs_report_id, is_report_id, ico, statement_id, period_end, norm_period)
-SELECT bs_report_id, is_report_id, ico, statement_id, period_end, norm_period
+SELECT
+  bs_report_id,
+  is_report_id,
+  ico,
+  statement_id,
+  period_end,
+  norm_period
 FROM pairs
 ON CONFLICT (bs_report_id, norm_period) DO UPDATE SET
   is_report_id = EXCLUDED.is_report_id,
@@ -695,28 +740,35 @@ ON CONFLICT (report_id, norm_period) DO UPDATE SET
   updated_at = now();
 """
 
-# -----------------------------
-# model_sk_pct, grades, duplicates, MV refresh: run once at end
-# (keeping your original SQL, unchanged)
-# -----------------------------
+SQL_GET_MODEL_SK_PCT_YEARS = """
+SELECT DISTINCT fiscal_year
+FROM core.fin_annual_features
+WHERE norm_period = 1
+  AND model_sk_raw IS NOT NULL
+  AND fiscal_year IS NOT NULL
+ORDER BY fiscal_year;
+"""
+
 SQL_REFRESH_MODEL_SK_PCT = """
 WITH ranked AS (
   SELECT
     report_id,
     norm_period,
+    fiscal_year,
     PERCENT_RANK() OVER (
-      PARTITION BY fiscal_year
       ORDER BY model_sk_raw
     ) AS pr
   FROM core.fin_annual_features
   WHERE norm_period = 1
     AND model_sk_raw IS NOT NULL
+    AND fiscal_year = %s
 )
 UPDATE core.fin_annual_features f
 SET model_sk_pct = r.pr
 FROM ranked r
 WHERE f.report_id = r.report_id
-  AND f.norm_period = r.norm_period;
+  AND f.norm_period = r.norm_period
+  AND f.fiscal_year = r.fiscal_year;
 """
 
 SQL_REFRESH_GRADES = """  -- your original (unchanged)
@@ -983,17 +1035,23 @@ def run(rebuild: bool = True) -> None:
         # -----------------------------
         # Global steps (once)
         # -----------------------------
-        log.info("Refreshing model_sk_pct (global).")
-        conn.execute(SQL_REFRESH_MODEL_SK_PCT)
-        conn.commit()
+        log.info("Refreshing model_sk_pct by fiscal_year.")
+        years = _fetch_model_sk_pct_years(conn)
+
+        for year in years:
+            conn.execute(SQL_REFRESH_MODEL_SK_PCT, (year,))
+            conn.commit()
+            log.info("Refreshed model_sk_pct for fiscal_year=%s", year)
 
         log.info("Refreshing grades (global).")
         conn.execute(SQL_REFRESH_GRADES)
+        log.info("Deleting duplicate grades (global).")
         conn.execute(SQL_DELETE_DUPLICATE_GRADES)
         conn.commit()
 
         # Post-commit MV refresh (nice-to-have)
         try:
+            log.info("Refreshing materialized views (global).")
             conn.execute(SQL_REFRESH_MV_TOP10_BY_GRADE_YEAR)
             conn.execute(SQL_REFRESH_MV_COMPANY_BENCHMARK_DIM)
             conn.execute(SQL_REFRESH_MV_COMPANY_BENCHMARK_FACT)
@@ -1002,4 +1060,4 @@ def run(rebuild: bool = True) -> None:
             conn.rollback()
             log.exception("MV refresh failed (continuing).")
 
-    log.info("FIN ETL finished (batch rebuild with strict 21/22 pairing).")
+    log.info("FIN ETL finished.")
