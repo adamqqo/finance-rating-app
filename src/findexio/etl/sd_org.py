@@ -25,6 +25,9 @@ ORG_URL = f"{SD_API_BASE}/organizations/{{id}}"
 # =========================
 ALLOWED_LEGAL_FORMS = ("112", "121")  # s.r.o., a.s.
 
+# Shared HTTP session
+_SESSION = requests.Session()
+
 
 # =========================
 # Cursor state in DB (core.rpo_bulk_state)
@@ -84,6 +87,84 @@ class SdHttpError(RuntimeError):
     pass
 
 
+class SdRateLimiter:
+    """
+    Shared per-process limiter for Slovensko.Digital API.
+
+    Uses response headers:
+      - X-RateLimit-Limit
+      - X-RateLimit-Remaining
+      - X-RateLimit-Reset   (unix timestamp)
+    """
+
+    def __init__(self) -> None:
+        self.limit: Optional[int] = None
+        self.remaining: Optional[int] = None
+        self.reset_ts: Optional[int] = None
+
+    def _now(self) -> int:
+        return int(time.time())
+
+    def wait_if_needed(self) -> None:
+        """
+        If previous response told us quota is exhausted, sleep before next request.
+        """
+        if self.remaining is None or self.reset_ts is None:
+            return
+
+        now = self._now()
+
+        if now >= self.reset_ts:
+            self.remaining = None
+            self.reset_ts = None
+            return
+
+        if self.remaining <= 0:
+            sleep_s = max(0, self.reset_ts - now) + 1
+            log.info("SD quota exhausted; sleeping %ss until reset", sleep_s)
+            time.sleep(sleep_s)
+            self.remaining = None
+            self.reset_ts = None
+
+    def update_from_response(self, resp: requests.Response) -> None:
+        """
+        Persist rate-limit state from response headers.
+        """
+        try:
+            limit = resp.headers.get("X-RateLimit-Limit")
+            remaining = resp.headers.get("X-RateLimit-Remaining")
+            reset = resp.headers.get("X-RateLimit-Reset")
+
+            if limit is not None and str(limit).isdigit():
+                self.limit = int(limit)
+
+            if remaining is not None and str(remaining).isdigit():
+                self.remaining = int(remaining)
+
+            if reset is not None and str(reset).isdigit():
+                self.reset_ts = int(reset)
+        except Exception:
+            log.debug("Failed to parse SD rate-limit headers", exc_info=True)
+
+    def maybe_sleep_after_response(self) -> None:
+        """
+        Sleep immediately after response if API reports we have no quota left.
+        """
+        if self.remaining is None or self.reset_ts is None:
+            return
+
+        now = self._now()
+        if self.remaining <= 0 and now < self.reset_ts:
+            sleep_s = max(0, self.reset_ts - now) + 1
+            log.info("SD rate limit reached; sleeping %ss", sleep_s)
+            time.sleep(sleep_s)
+            self.remaining = None
+            self.reset_ts = None
+
+
+_SD_LIMITER = SdRateLimiter()
+
+
 def _parse_next_link(link_header: Optional[str]) -> Optional[str]:
     """
     Extract rel=next from HTTP Link header.
@@ -103,68 +184,99 @@ def _parse_next_link(link_header: Optional[str]) -> Optional[str]:
     return None
 
 
-def _throttle_from_headers(resp: requests.Response) -> None:
+def _request_json(
+    url: str,
+    *,
+    timeout: int = 60,
+    expected_type: type,
+    max_retries: int = 5,
+) -> Tuple[Any, requests.Response]:
     """
-    Respect SD rate limiting headers if present.
+    Robust JSON request with:
+      - shared rate-limit awareness
+      - 429 retry loop
+      - header-based sleeping
+      - basic transient retry handling
     """
-    try:
-        remaining = resp.headers.get("X-RateLimit-Remaining")
-        reset = resp.headers.get("X-RateLimit-Reset")
-        if remaining is None or reset is None:
-            return
-        remaining_i = int(remaining)
-        reset_i = int(reset)
-        if remaining_i <= 1:
-            now = int(time.time())
-            sleep_s = max(0, reset_i - now) + 1
-            log.info("SD rate limit reached; sleeping %ss", sleep_s)
+    last_err: Optional[Exception] = None
+
+    for attempt in range(1, max_retries + 1):
+        _SD_LIMITER.wait_if_needed()
+
+        try:
+            resp = _SESSION.get(url, timeout=timeout)
+        except requests.RequestException as e:
+            last_err = e
+            sleep_s = min(2**attempt, 30)
+            log.warning(
+                "SD request transport error on attempt %s/%s: %s; sleeping %ss",
+                attempt,
+                max_retries,
+                e,
+                sleep_s,
+            )
             time.sleep(sleep_s)
-    except Exception:
-        return
+            continue
+
+        _SD_LIMITER.update_from_response(resp)
+
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after and retry_after.isdigit():
+                sleep_s = int(retry_after) + 1
+            elif _SD_LIMITER.reset_ts is not None:
+                sleep_s = max(0, _SD_LIMITER.reset_ts - int(time.time())) + 1
+            else:
+                sleep_s = min(2**attempt, 30)
+
+            log.warning(
+                "SD 429 rate-limited on attempt %s/%s; sleeping %ss",
+                attempt,
+                max_retries,
+                sleep_s,
+            )
+            time.sleep(sleep_s)
+            continue
+
+        if 500 <= resp.status_code < 600:
+            sleep_s = min(2**attempt, 30)
+            log.warning(
+                "SD server error %s on attempt %s/%s; sleeping %ss",
+                resp.status_code,
+                attempt,
+                max_retries,
+                sleep_s,
+            )
+            time.sleep(sleep_s)
+            continue
+
+        if not resp.ok:
+            raise SdHttpError(f"SD request failed: {resp.status_code} {resp.text[:300]}")
+
+        try:
+            data = resp.json()
+        except Exception as e:
+            raise SdHttpError(f"Invalid JSON from {url}: {e}") from e
+
+        if not isinstance(data, expected_type):
+            raise SdHttpError(
+                f"Expected {expected_type.__name__} JSON from {url}, got {type(data).__name__}"
+            )
+
+        _SD_LIMITER.maybe_sleep_after_response()
+        return data, resp
+
+    raise SdHttpError(f"SD request failed after {max_retries} retries: {url}; last_err={last_err}")
 
 
 def _get_list(url: str, *, timeout: int = 60) -> Tuple[List[Dict[str, Any]], requests.Response]:
-    r = requests.get(url, timeout=timeout)
-
-    if r.status_code == 429:
-        retry_after = r.headers.get("Retry-After")
-        sleep_s = int(retry_after) if (retry_after and retry_after.isdigit()) else 5
-        log.warning("SD 429 rate-limited; sleeping %ss", sleep_s)
-        time.sleep(sleep_s)
-        r = requests.get(url, timeout=timeout)
-
-    if not r.ok:
-        raise SdHttpError(f"SD request failed: {r.status_code} {r.text[:200]}")
-
-    _throttle_from_headers(r)
-
-    data = r.json()
-    if not isinstance(data, list):
-        raise SdHttpError(f"Expected list JSON from {url}, got {type(data)}")
-
-    return data, r
+    data, resp = _request_json(url, timeout=timeout, expected_type=list)
+    return data, resp
 
 
 def _get_obj(url: str, *, timeout: int = 60) -> Tuple[Dict[str, Any], requests.Response]:
-    r = requests.get(url, timeout=timeout)
-
-    if r.status_code == 429:
-        retry_after = r.headers.get("Retry-After")
-        sleep_s = int(retry_after) if (retry_after and retry_after.isdigit()) else 5
-        log.warning("SD 429 rate-limited; sleeping %ss", sleep_s)
-        time.sleep(sleep_s)
-        r = requests.get(url, timeout=timeout)
-
-    if not r.ok:
-        raise SdHttpError(f"SD request failed: {r.status_code} {r.text[:200]}")
-
-    _throttle_from_headers(r)
-
-    data = r.json()
-    if not isinstance(data, dict):
-        raise SdHttpError(f"Expected object JSON from {url}, got {type(data)}")
-
-    return data, r
+    data, resp = _request_json(url, timeout=timeout, expected_type=dict)
+    return data, resp
 
 
 # =========================
@@ -193,7 +305,7 @@ def _norm_org_min(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not ident or ident.get("ipo") is None:
         return None
 
-    ico = int(ident["ipo"])
+    ico = str(ident["ipo"]).strip()
     sd_org_id = int(payload["id"])
 
     mac = payload.get("main_activity_code")
@@ -215,7 +327,7 @@ def _norm_org_min(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-def _norm_addresses(payload: Dict[str, Any], ico: int, sd_org_id: int) -> List[Dict[str, Any]]:
+def _norm_addresses(payload: Dict[str, Any], ico: str, sd_org_id: int) -> List[Dict[str, Any]]:
     entries = payload.get("address_entries") or []
     if not isinstance(entries, list) or not entries:
         return []
@@ -247,7 +359,7 @@ def _norm_addresses(payload: Dict[str, Any], ico: int, sd_org_id: int) -> List[D
     return out
 
 
-def _norm_successors(payload: Dict[str, Any], ico: int, sd_org_id: int) -> List[Dict[str, Any]]:
+def _norm_successors(payload: Dict[str, Any], ico: str, sd_org_id: int) -> List[Dict[str, Any]]:
     entries = payload.get("successor_entries") or []
     if not isinstance(entries, list) or not entries:
         return []
@@ -273,7 +385,7 @@ def _norm_successors(payload: Dict[str, Any], ico: int, sd_org_id: int) -> List[
 # =========================
 # Filter allowed ICOs via core.rpo_all_orgs
 # =========================
-def _allowed_icos_from_rpo_all_orgs(icos: List[int]) -> set[int]:
+def _allowed_icos_from_rpo_all_orgs(icos: List[str]) -> set[str]:
     """
     Returns ICO set that exists in core.rpo_all_orgs AND has legal_form_code in (112,121).
     If an ICO isn't in rpo_all_orgs, it will NOT be allowed (strict enrichment policy).
@@ -292,7 +404,7 @@ def _allowed_icos_from_rpo_all_orgs(icos: List[int]) -> set[int]:
             (icos, list(ALLOWED_LEGAL_FORMS)),
         ).fetchall()
 
-    return {int(r[0]) for r in rows}
+    return {str(r[0]) for r in rows}
 
 
 # =========================
@@ -398,7 +510,7 @@ def _db_upsert_batch(
                 # reset current flags only for touched ICOs
                 ico_set = sorted({r["ico"] for r in address_rows})
                 cur.execute(
-                    "UPDATE core.sd_org_address SET is_current = FALSE WHERE ico = ANY(%s)",
+                    "UPDATE core.sd_org_address SET is_current = FALSE WHERE ico = ANY(%s::text[])",
                     (ico_set,),
                 )
                 cur.executemany(SQL_UPSERT_ADDRESS, address_rows)
@@ -417,7 +529,12 @@ def _build_sync_url(since: str, last_id: int) -> str:
     return f"{SYNC_URL}?since={since}&last_id={last_id}&only_ids"
 
 
-def run_sync(*, hard_limit: Optional[int] = None, db_batch_size: int = 200) -> int:
+def run_sync(
+    *,
+    hard_limit: Optional[int] = None,
+    detail_fetch_limit: Optional[int] = None,
+    db_batch_size: int = 200,
+) -> int:
     """
     SD incremental sync:
       - pull changed IDs from /sync?since=...&last_id=...&only_ids
@@ -458,7 +575,6 @@ def run_sync(*, hard_limit: Optional[int] = None, db_batch_size: int = 200) -> i
         if not pending:
             return
 
-        # filter ICOs via your own registry table
         icos = [p[2]["ico"] for p in pending]
         allowed = _allowed_icos_from_rpo_all_orgs(icos)
 
@@ -473,7 +589,6 @@ def run_sync(*, hard_limit: Optional[int] = None, db_batch_size: int = 200) -> i
                 skipped_not_allowed += 1
                 continue
 
-            # activity dim row
             if org_min.get("main_activity_code_id") is not None:
                 activity_rows.append(
                     {
@@ -484,7 +599,6 @@ def run_sync(*, hard_limit: Optional[int] = None, db_batch_size: int = 200) -> i
                     }
                 )
 
-            # org row
             org_rows.append(
                 {
                     "ico": ico,
@@ -541,7 +655,6 @@ def run_sync(*, hard_limit: Optional[int] = None, db_batch_size: int = 200) -> i
             if upd:
                 last_seen = SdCursor(since=str(upd), last_id=int(item["id"]))
 
-            # flush by batch size of pending details
             if len(pending) >= db_batch_size:
                 flush_pending()
                 if last_seen:
@@ -561,21 +674,27 @@ def run_sync(*, hard_limit: Optional[int] = None, db_batch_size: int = 200) -> i
                     last_seen.since if last_seen else None,
                 )
 
+            if detail_fetch_limit is not None and fetched_details >= detail_fetch_limit:
+                log.info("SD detail_fetch_limit reached: %s", detail_fetch_limit)
+                next_url = None
+                break
+
             if hard_limit is not None and processed_allowed >= hard_limit:
                 log.info("SD hard_limit reached (allowed processed): %s", hard_limit)
                 next_url = None
                 break
+
+        if detail_fetch_limit is not None and fetched_details >= detail_fetch_limit:
+            break
 
         if hard_limit is not None and processed_allowed >= hard_limit:
             break
 
         next_url = _parse_next_link(resp.headers.get("Link"))
 
-        # if no next, persist cursor now (even if pending exists)
         if not next_url and last_seen:
             _set_cursor(last_seen)
 
-    # final flush
     flush_pending()
     if last_seen:
         _set_cursor(last_seen)
