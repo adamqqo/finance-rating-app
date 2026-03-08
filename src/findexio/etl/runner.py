@@ -132,7 +132,7 @@ def daily() -> None:
     ruz_report_items.run_sync(
         legal_forms=("112", "121"),
         hard_limit=500,
-        use_state_cursor=True
+        use_state_cursor=False
     )
     time.sleep(5)
 
