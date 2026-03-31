@@ -11,7 +11,7 @@ log = logging.getLogger("findexio.fin_etl")
 # Tuning knobs
 # -----------------------------
 BATCH_SIZE_SINGLE = 5000   # 699 + 687 report_id batch
-BATCH_SIZE_PAIRS = 5000    # number of (21,22) pairs per batch
+BATCH_SIZE_PAIRS = 250    # number of (21,22) pairs per batch
 
 def _fetch_model_sk_pct_years(conn) -> List[int]:
     rows = conn.execute(SQL_GET_MODEL_SK_PCT_YEARS).fetchall()
@@ -347,14 +347,9 @@ WITH pair_batch AS (
   FROM core.fin_etl_pairs p
   WHERE p.bs_report_id = ANY(%s)
 ),
-items AS (
+bs_items AS (
   SELECT
-    -- canonical report id = bs_report_id for both 21 and 22
-    CASE
-      WHEN i.template_id = 21 THEN i.report_id
-      WHEN i.template_id = 22 THEN pb.bs_report_id
-    END AS report_id,
-
+    pb.bs_report_id AS report_id,
     CASE
       WHEN i.table_name = 'Strana aktív' AND i.period_col = 3 THEN 1
       WHEN i.table_name = 'Strana aktív' AND i.period_col = 4 THEN 2
@@ -364,7 +359,6 @@ items AS (
 
     i.ico,
     r.id_uctovnej_zavierky AS statement_id,
-    -- store BS template_id for continuity
     21::bigint AS template_id,
 
     core.parse_ruztxt_date(i.obdobie_do) AS period_end,
@@ -376,11 +370,10 @@ items AS (
     i.table_name,
     m.metric_key,
     (COALESCE(i.value_num, 0) * m.sign_mult * m.weight) AS v
-
   FROM pair_batch pb
   JOIN core.ruz_report_items i
-    ON (i.report_id = pb.bs_report_id AND i.template_id = 21)
-    OR (i.report_id = pb.is_report_id AND i.template_id = 22)
+    ON i.report_id = pb.bs_report_id
+   AND i.template_id = 21
   JOIN core.ruz_reports r
     ON r.id = i.report_id
   JOIN core.fin_item_map m
@@ -392,6 +385,50 @@ items AS (
          (i.table_name = 'Strana aktív' AND i.period_col IN (3,4))
       OR (i.table_name <> 'Strana aktív' AND i.period_col IN (1,2))
     )
+),
+is_items AS (
+  SELECT
+    pb.bs_report_id AS report_id,
+    CASE
+      WHEN i.table_name = 'Strana aktív' AND i.period_col = 3 THEN 1
+      WHEN i.table_name = 'Strana aktív' AND i.period_col = 4 THEN 2
+      WHEN i.table_name <> 'Strana aktív' AND i.period_col = 1 THEN 1
+      WHEN i.table_name <> 'Strana aktív' AND i.period_col = 2 THEN 2
+    END AS norm_period,
+
+    i.ico,
+    r.id_uctovnej_zavierky AS statement_id,
+    21::bigint AS template_id,
+
+    core.parse_ruztxt_date(i.obdobie_do) AS period_end,
+    EXTRACT(YEAR FROM core.parse_ruztxt_date(i.obdobie_do))::INT AS fiscal_year,
+
+    r.mena AS currency,
+    i.pravna_forma AS legal_form,
+
+    i.table_name,
+    m.metric_key,
+    (COALESCE(i.value_num, 0) * m.sign_mult * m.weight) AS v
+  FROM pair_batch pb
+  JOIN core.ruz_report_items i
+    ON i.report_id = pb.is_report_id
+   AND i.template_id = 22
+  JOIN core.ruz_reports r
+    ON r.id = i.report_id
+  JOIN core.fin_item_map m
+    ON m.template_id = i.template_id
+   AND m.table_name  = i.table_name
+   AND m.row_number  = i.row_number
+  WHERE core.parse_ruztxt_date(i.obdobie_do) IS NOT NULL
+    AND (
+         (i.table_name = 'Strana aktív' AND i.period_col IN (3,4))
+      OR (i.table_name <> 'Strana aktív' AND i.period_col IN (1,2))
+    )
+),
+items AS (
+  SELECT * FROM bs_items
+  UNION ALL
+  SELECT * FROM is_items
 ),
 pivot AS (
   SELECT
