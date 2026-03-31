@@ -1053,21 +1053,47 @@ def run(rebuild: bool = True) -> None:
         # -----------------------------
         # Process 21/22 pairs in batches
         # -----------------------------
-        log.info("Processing 21/22 paired aggregates+features in batches.")
+        log.info(
+            "Processing 21/22 paired aggregates+features in batches (batch_size=%s).",
+            BATCH_SIZE_PAIRS,
+        )
         while True:
             pairs = _fetch_batch_pairs(conn, BATCH_SIZE_PAIRS)
             if not pairs:
                 break
 
             bs_ids = [p[0] for p in pairs]
-            # aggregates: canonical uses bs_ids subset; reads both bs & is via fin_etl_pairs
-            conn.execute(SQL_REFRESH_AGGREGATES_PAIRS_BATCH, (bs_ids,))
-            # features computed from aggregates for bs report_ids (canonical ids)
-            conn.execute(SQL_REFRESH_FEATURES_BATCH, (bs_ids,))
-            conn.execute(SQL_DELETE_BATCH_PAIRS, (bs_ids,))
-            conn.commit()
+            min_bs = min(bs_ids)
+            max_bs = max(bs_ids)
 
-            log.info("Processed pairs batch: %s pairs", len(bs_ids))
+            log.info(
+                "Starting pairs batch: size=%s, min_bs=%s, max_bs=%s",
+                len(bs_ids),
+                min_bs,
+                max_bs,
+            )
+
+            try:
+                conn.execute(SQL_REFRESH_AGGREGATES_PAIRS_BATCH, (bs_ids,))
+                conn.commit()
+                log.info("Finished pair aggregates batch: %s pairs", len(bs_ids))
+
+                conn.execute(SQL_REFRESH_FEATURES_BATCH, (bs_ids,))
+                conn.commit()
+                log.info("Finished pair features batch: %s pairs", len(bs_ids))
+
+                conn.execute(SQL_DELETE_BATCH_PAIRS, (bs_ids,))
+                conn.commit()
+                log.info("Processed pairs batch: %s pairs", len(bs_ids))
+            except Exception:
+                conn.rollback()
+                log.exception(
+                    "Pair batch failed: size=%s, min_bs=%s, max_bs=%s",
+                    len(bs_ids),
+                    min_bs,
+                    max_bs,
+                )
+                raise
 
         # -----------------------------
         # Global steps (once)
