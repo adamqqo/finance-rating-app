@@ -1052,12 +1052,12 @@ def run(rebuild: bool = True) -> None:
             log.info("Rebuild mode: TRUNCATE target tables.")
             conn.execute(SQL_TRUNCATE_ALL)
             conn.commit()
-
+"""
         log.info("Preparing helper tables (unlogged).")
         conn.execute(SQL_DROP_HELPERS)
         conn.execute(SQL_CREATE_HELPERS)
         conn.commit()
-
+        """
         log.info("Building queue for 699/687 (single reports).")
         conn.execute(SQL_POPULATE_QUEUE_SINGLE)
         conn.commit()
