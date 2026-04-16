@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 from ..db import get_conn
 
@@ -11,13 +11,11 @@ log = logging.getLogger("findexio.fin_etl")
 # Tuning knobs
 # -----------------------------
 BATCH_SIZE_SINGLE = 5000   # 699 + 687 report_id batch
-BATCH_SIZE_PAIRS = 250     # number of (21,22) pairs per batch
-BATCH_SIZE_GRADES = 10000  # number of report_ids per grade batch
+BATCH_SIZE_PAIRS = 250    # number of (21,22) pairs per batch
 
 def _fetch_model_sk_pct_years(conn) -> List[int]:
     rows = conn.execute(SQL_GET_MODEL_SK_PCT_YEARS).fetchall()
     return [r[0] for r in rows]
-
 # -----------------------------
 # Rebuild truncates
 # -----------------------------
@@ -35,7 +33,6 @@ RESTART IDENTITY;
 SQL_DROP_HELPERS = """
 DROP TABLE IF EXISTS core.fin_etl_queue_single;
 DROP TABLE IF EXISTS core.fin_etl_pairs;
-DROP TABLE IF EXISTS core.fin_etl_queue_grades;
 """
 
 SQL_CREATE_HELPERS = """
@@ -53,21 +50,15 @@ CREATE UNLOGGED TABLE IF NOT EXISTS core.fin_etl_pairs (
   PRIMARY KEY (bs_report_id, norm_period)
 );
 
-CREATE UNLOGGED TABLE IF NOT EXISTS core.fin_etl_queue_grades (
-  report_id bigint PRIMARY KEY
-);
-
 -- Helpful indexes for batch fetch
-CREATE INDEX IF NOT EXISTS ix_fin_etl_pairs_is
-  ON core.fin_etl_pairs (is_report_id);
-
-CREATE INDEX IF NOT EXISTS ix_fin_etl_pairs_key
-  ON core.fin_etl_pairs (ico, statement_id, period_end, norm_period);
+CREATE INDEX IF NOT EXISTS ix_fin_etl_pairs_is ON core.fin_etl_pairs (is_report_id);
+CREATE INDEX IF NOT EXISTS ix_fin_etl_pairs_key ON core.fin_etl_pairs (ico, statement_id, period_end, norm_period);
 """
 
 # -----------------------------
 # Populate queues
 # -----------------------------
+# 699 + 687: queue report_ids directly (using minimal filters to avoid useless rows)
 SQL_POPULATE_QUEUE_SINGLE = """
 INSERT INTO core.fin_etl_queue_single (report_id)
 SELECT d.report_id
@@ -76,6 +67,7 @@ WHERE d.template_id IN (699, 687)
 ON CONFLICT DO NOTHING;
 """
 
+# 21/22: build strict pairs into core.fin_etl_pairs
 SQL_POPULATE_PAIRS_21_22 = """
 WITH done_21 AS (
   SELECT d.report_id
@@ -180,14 +172,6 @@ ON CONFLICT (bs_report_id, norm_period) DO UPDATE SET
   norm_period = EXCLUDED.norm_period;
 """
 
-SQL_POPULATE_QUEUE_GRADES = """
-INSERT INTO core.fin_etl_queue_grades (report_id)
-SELECT f.report_id
-FROM core.fin_annual_features f
-WHERE f.norm_period = 1
-ON CONFLICT DO NOTHING;
-"""
-
 # -----------------------------
 # Batch fetch helpers
 # -----------------------------
@@ -213,18 +197,6 @@ LIMIT %s;
 SQL_DELETE_BATCH_PAIRS = """
 DELETE FROM core.fin_etl_pairs
 WHERE bs_report_id = ANY(%s);
-"""
-
-SQL_FETCH_BATCH_GRADES = """
-SELECT report_id
-FROM core.fin_etl_queue_grades
-ORDER BY report_id
-LIMIT %s;
-"""
-
-SQL_DELETE_BATCH_GRADES = """
-DELETE FROM core.fin_etl_queue_grades
-WHERE report_id = ANY(%s);
 """
 
 # -----------------------------
@@ -361,6 +333,7 @@ ON CONFLICT (ico, fiscal_year, norm_period, report_id) DO UPDATE SET
 
 # -----------------------------
 # Aggregates: batch for paired 21/22
+# We canonicalize all 22 rows to bs_report_id; strict pairs only.
 # -----------------------------
 SQL_REFRESH_AGGREGATES_PAIRS_BATCH = """
 WITH pair_batch AS (
@@ -537,6 +510,7 @@ ON CONFLICT (ico, fiscal_year, norm_period, report_id) DO UPDATE SET
 
 # -----------------------------
 # Features: batch insert/update for report_ids
+# (based on your original SQL, but filtered to report_ids)
 # -----------------------------
 SQL_REFRESH_FEATURES_BATCH = """
 WITH a1 AS (
@@ -834,10 +808,7 @@ WHERE f.report_id = r.report_id
   AND f.fiscal_year = r.fiscal_year;
 """
 
-# -----------------------------
-# Grades: batched by report_id
-# -----------------------------
-SQL_REFRESH_GRADES_BATCH = """
+SQL_REFRESH_GRADES = """  -- your original (unchanged)
 INSERT INTO core.fin_health_grade (
     report_id, norm_period,
     ico, fiscal_year, statement_id, period_end,
@@ -866,7 +837,6 @@ WITH src AS (
     f.cf_kralicek
   FROM core.fin_annual_features f
   WHERE f.norm_period = 1
-    AND f.report_id = ANY(%s)
 ),
 valid AS (
   SELECT
@@ -1036,11 +1006,6 @@ def _fetch_batch_pairs(conn, limit: int) -> List[Tuple[int, int]]:
     return [(r[0], r[1]) for r in rows]
 
 
-def _fetch_batch_grades(conn, limit: int) -> List[int]:
-    rows = conn.execute(SQL_FETCH_BATCH_GRADES, (limit,)).fetchall()
-    return [r[0] for r in rows]
-
-
 def run(rebuild: bool = True) -> None:
     """
     rebuild=True:
@@ -1051,7 +1016,6 @@ def run(rebuild: bool = True) -> None:
     This avoids massive temp spills on 100M+ ruz_report_items by batching.
     """
     with get_conn() as conn:
-        """
         if rebuild:
             log.info("Rebuild mode: TRUNCATE target tables.")
             conn.execute(SQL_TRUNCATE_ALL)
@@ -1141,45 +1105,9 @@ def run(rebuild: bool = True) -> None:
             conn.execute(SQL_REFRESH_MODEL_SK_PCT, (year,))
             conn.commit()
             log.info("Refreshed model_sk_pct for fiscal_year=%s", year)
-"""
-        # -----------------------------
-        # Grades in batches
-        # -----------------------------
-        log.info("Building queue for grades.")
-        conn.execute(SQL_POPULATE_QUEUE_GRADES)
-        conn.commit()
 
-        log.info("Refreshing grades in batches (batch_size=%s).", BATCH_SIZE_GRADES)
-        while True:
-            grade_ids = _fetch_batch_grades(conn, BATCH_SIZE_GRADES)
-            if not grade_ids:
-                break
-
-            min_id = min(grade_ids)
-            max_id = max(grade_ids)
-
-            log.info(
-                "Starting grades batch: size=%s, min_report_id=%s, max_report_id=%s",
-                len(grade_ids),
-                min_id,
-                max_id,
-            )
-
-            try:
-                conn.execute(SQL_REFRESH_GRADES_BATCH, (grade_ids,))
-                conn.execute(SQL_DELETE_BATCH_GRADES, (grade_ids,))
-                conn.commit()
-                log.info("Processed grades batch: %s report_ids", len(grade_ids))
-            except Exception:
-                conn.rollback()
-                log.exception(
-                    "Grades batch failed: size=%s, min_report_id=%s, max_report_id=%s",
-                    len(grade_ids),
-                    min_id,
-                    max_id,
-                )
-                raise
-
+        log.info("Refreshing grades (global).")
+        conn.execute(SQL_REFRESH_GRADES)
         log.info("Deleting duplicate grades (global).")
         conn.execute(SQL_DELETE_DUPLICATE_GRADES)
         conn.commit()
