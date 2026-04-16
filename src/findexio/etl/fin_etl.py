@@ -12,6 +12,7 @@ log = logging.getLogger("findexio.fin_etl")
 # -----------------------------
 BATCH_SIZE_SINGLE = 5000   # 699 + 687 report_id batch
 BATCH_SIZE_PAIRS = 250    # number of (21,22) pairs per batch
+BATCH_SIZE_GRADES = 5000  # number of report_ids for grades refresh batch
 
 def _fetch_model_sk_pct_years(conn) -> List[int]:
     rows = conn.execute(SQL_GET_MODEL_SK_PCT_YEARS).fetchall()
@@ -33,6 +34,7 @@ RESTART IDENTITY;
 SQL_DROP_HELPERS = """
 DROP TABLE IF EXISTS core.fin_etl_queue_single;
 DROP TABLE IF EXISTS core.fin_etl_pairs;
+DROP TABLE IF EXISTS core.fin_etl_queue_grade;
 """
 
 SQL_CREATE_HELPERS = """
@@ -53,6 +55,10 @@ CREATE UNLOGGED TABLE IF NOT EXISTS core.fin_etl_pairs (
 -- Helpful indexes for batch fetch
 CREATE INDEX IF NOT EXISTS ix_fin_etl_pairs_is ON core.fin_etl_pairs (is_report_id);
 CREATE INDEX IF NOT EXISTS ix_fin_etl_pairs_key ON core.fin_etl_pairs (ico, statement_id, period_end, norm_period);
+
+CREATE UNLOGGED TABLE IF NOT EXISTS core.fin_etl_queue_grade (
+  report_id bigint PRIMARY KEY
+);
 """
 
 # -----------------------------
@@ -172,6 +178,14 @@ ON CONFLICT (bs_report_id, norm_period) DO UPDATE SET
   norm_period = EXCLUDED.norm_period;
 """
 
+SQL_POPULATE_QUEUE_GRADES = """
+INSERT INTO core.fin_etl_queue_grade (report_id)
+SELECT DISTINCT f.report_id
+FROM core.fin_annual_features f
+WHERE f.norm_period = 1
+ON CONFLICT DO NOTHING;
+"""
+
 # -----------------------------
 # Batch fetch helpers
 # -----------------------------
@@ -197,6 +211,18 @@ LIMIT %s;
 SQL_DELETE_BATCH_PAIRS = """
 DELETE FROM core.fin_etl_pairs
 WHERE bs_report_id = ANY(%s);
+"""
+
+SQL_FETCH_BATCH_GRADES = """
+SELECT report_id
+FROM core.fin_etl_queue_grade
+ORDER BY report_id
+LIMIT %s;
+"""
+
+SQL_DELETE_BATCH_GRADES = """
+DELETE FROM core.fin_etl_queue_grade
+WHERE report_id = ANY(%s);
 """
 
 # -----------------------------
@@ -808,7 +834,7 @@ WHERE f.report_id = r.report_id
   AND f.fiscal_year = r.fiscal_year;
 """
 
-SQL_REFRESH_GRADES = """  -- your original (unchanged)
+SQL_REFRESH_GRADES_BATCH = """
 INSERT INTO core.fin_health_grade (
     report_id, norm_period,
     ico, fiscal_year, statement_id, period_end,
@@ -837,6 +863,7 @@ WITH src AS (
     f.cf_kralicek
   FROM core.fin_annual_features f
   WHERE f.norm_period = 1
+    AND f.report_id = ANY(%s)
 ),
 valid AS (
   SELECT
@@ -1005,13 +1032,17 @@ def _fetch_batch_pairs(conn, limit: int) -> List[Tuple[int, int]]:
     rows = conn.execute(SQL_FETCH_BATCH_PAIRS, (limit,)).fetchall()
     return [(r[0], r[1]) for r in rows]
 
+def _fetch_batch_grades(conn, limit: int) -> List[int]:
+    rows = conn.execute(SQL_FETCH_BATCH_GRADES, (limit,)).fetchall()
+    return [r[0] for r in rows]
+
 
 def run(rebuild: bool = True) -> None:
     """
     rebuild=True:
       - TRUNCATE aggregates/features/grades
       - rebuild everything in batches (699/687 singles + 21/22 strict pairs)
-      - then pct + grades + MV refresh
+      - then pct + grades (batched) + MV refresh
 
     This avoids massive temp spills on 100M+ ruz_report_items by batching.
     """
@@ -1106,8 +1137,21 @@ def run(rebuild: bool = True) -> None:
             conn.commit()
             log.info("Refreshed model_sk_pct for fiscal_year=%s", year)
 
-        log.info("Refreshing grades (global).")
-        conn.execute(SQL_REFRESH_GRADES)
+        log.info("Building grade queue from refreshed features.")
+        conn.execute(SQL_POPULATE_QUEUE_GRADES)
+        conn.commit()
+
+        log.info("Refreshing grades in batches (batch_size=%s).", BATCH_SIZE_GRADES)
+        while True:
+            grade_ids = _fetch_batch_grades(conn, BATCH_SIZE_GRADES)
+            if not grade_ids:
+                break
+
+            conn.execute(SQL_REFRESH_GRADES_BATCH, (grade_ids,))
+            conn.execute(SQL_DELETE_BATCH_GRADES, (grade_ids,))
+            conn.commit()
+            log.info("Processed grade batch: %s report_ids", len(grade_ids))
+
         log.info("Deleting duplicate grades (global).")
         conn.execute(SQL_DELETE_DUPLICATE_GRADES)
         conn.commit()
