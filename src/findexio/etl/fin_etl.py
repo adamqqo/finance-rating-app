@@ -1047,17 +1047,17 @@ def run(rebuild: bool = True) -> None:
     This avoids massive temp spills on 100M+ ruz_report_items by batching.
     """
     with get_conn() as conn:
-        """
+
         if rebuild:
             log.info("Rebuild mode: TRUNCATE target tables.")
             conn.execute(SQL_TRUNCATE_ALL)
             conn.commit()
-"""
+
         log.info("Preparing helper tables (unlogged).")
         conn.execute(SQL_DROP_HELPERS)
         conn.execute(SQL_CREATE_HELPERS)
         conn.commit()
-        """
+
         log.info("Building queue for 699/687 (single reports).")
         conn.execute(SQL_POPULATE_QUEUE_SINGLE)
         conn.commit()
@@ -1137,7 +1137,7 @@ def run(rebuild: bool = True) -> None:
             conn.execute(SQL_REFRESH_MODEL_SK_PCT, (year,))
             conn.commit()
             log.info("Refreshed model_sk_pct for fiscal_year=%s", year)
-"""
+
         log.info("Building grade queue from refreshed features.")
         conn.execute(SQL_POPULATE_QUEUE_GRADES)
         conn.commit()

@@ -10,7 +10,6 @@
   "deploy": {
     "runtime": "V2",
     "numReplicas": 1,
-    "sleepApplication": true,
     "useLegacyStacker": false,
     "multiRegionConfig": {
       "europe-west4-drams3a": {

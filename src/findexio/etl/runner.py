@@ -136,11 +136,6 @@ def daily() -> None:
     )
     time.sleep(5)
 
-    # SD enrichment: Process max 100 organizations
-    log.info("Running sd_org (max 10 orgs)...")
-    sd_org_sync(hard_limit=10)
-    time.sleep(5)
-
     # Financial ETL: Process all available data (incremental by design)
     log.info("Running FIN_ETL...")
     fin_etl.run(rebuild=False)
